@@ -1,0 +1,22 @@
+#
+#  A DHCPv4 request must not be proxied.  DHCPv4 packet codes
+#  overlap the RADIUS packet codes, so the module has to check the
+#  protocol of the request, not the packet code.
+#
+#  test_fail writes a RADIUS attribute, so it cannot be called from
+#  the DHCPv4 subrequest.  The subrequest sets Auth-Type in the parent
+#  only when the module logs the expected error.
+#
+subrequest @dhcpv4::Discover {
+	if (%proxy.sendto.ipaddr(127.0.0.1, 1812, 'testing123')) {
+		return
+	}
+
+	if (Module-Failure-Message[*] == "Cannot proxy DHCPv4 request, use 'subrequest' to create a RADIUS request") {
+		parent.control.Auth-Type := ::Accept
+	}
+}
+
+if (!control.Auth-Type) {
+	test_fail
+}

@@ -2854,10 +2854,23 @@ static xlat_action_t xlat_radius_replicate(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcu
 	}
 
 	/*
+	 *	The unlang compiler rejects a call to this module from a virtual server whose namespace is not
+	 *	RADIUS, but does not check an xlat call.  Packet codes of other protocols overlap the RADIUS
+	 *	packet codes.  A DHCPv4 Discover has code 1, the code of an Access-Request, and passes the
+	 *	packet code check below.
+	 */
+	if (!fr_dict_compatible(request->proto_dict, dict_radius)) {
+		REDEBUG("Cannot replicate %s request, use 'subrequest' to create a RADIUS request",
+			fr_dict_root(request->proto_dict)->name);
+		return XLAT_ACTION_FAIL;
+	}
+
+	/*
 	 *	The encoder indexes tables by the packet code.
 	 */
 	if (!FR_RADIUS_PACKET_CODE_VALID(request->packet->code)) {
-		REDEBUG("Cannot replicate packet code %u, it is not a RADIUS packet code", request->packet->code);
+		REDEBUG("Cannot replicate request, packet code %u is outside the range of RADIUS packet codes",
+			request->packet->code);
 		return XLAT_ACTION_FAIL;
 	}
 
@@ -3002,6 +3015,27 @@ static xlat_action_t xlat_radius_client(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcurso
 	int			rcode;
 
 	XLAT_ARGS(args, &ipaddr, &port, &secret);
+
+	/*
+	 *	The unlang compiler rejects a call to this module from a virtual server whose namespace is not
+	 *	RADIUS, but does not check an xlat call.  Packet codes of other protocols overlap the RADIUS
+	 *	packet codes.  A DHCPv4 Discover has code 1, the code of an Access-Request, and passes the
+	 *	packet code check below.
+	 */
+	if (!fr_dict_compatible(request->proto_dict, dict_radius)) {
+		REDEBUG("Cannot proxy %s request, use 'subrequest' to create a RADIUS request",
+			fr_dict_root(request->proto_dict)->name);
+		return XLAT_ACTION_FAIL;
+	}
+
+	/*
+	 *	mod_enqueue() indexes the retry configuration by the packet code.
+	 */
+	if ((request->packet->code >= FR_RADIUS_CODE_MAX) ||
+	    !fr_time_delta_ispos(inst->retry[request->packet->code].irt)) { /* can't be zero */
+		REDEBUG("Invalid packet code %u", request->packet->code);
+		return XLAT_ACTION_FAIL;
+	}
 
 	/*
 	 *	Can't change IP address families.
