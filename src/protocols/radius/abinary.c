@@ -483,13 +483,16 @@ static int ascend_parse_ipx_net(int argc, char **argv,
 	/*
 	 *	Parse the value.
 	 */
-	token = strtoul(argv[5], NULL, 16);
-	if (token > 65535) {
-		fr_strerror_printf("Socket value '%s' is too large for IPX network filter", argv[5]);
-		return -1;
-	}
+	{
+		unsigned long ipx_socket = strtoul(argv[5], NULL, 16);
 
-	net->socket = token;
+		if (ipx_socket > UINT16_MAX) {
+			fr_strerror_printf("Socket value '%s' is too large for IPX network filter", argv[5]);
+			return -1;
+		}
+
+		net->socket = (uint16_t) ipx_socket;
+	}
 	net->socket = htons(net->socket);
 
 
@@ -896,6 +899,10 @@ static int ascend_parse_ip(int argc, char **argv, ascend_ip_filter_t *filter)
 					return -1;
 				}
 			}
+			if (token > UINT8_MAX) {
+				fr_strerror_printf("IP protocol \"%s\" is too large in IP data filter", argv[0]);
+				return -1;
+			}
 			filter->proto = token;
 			flags |= IP_PROTO_FLAG;
 
@@ -1026,6 +1033,10 @@ static int ascend_parse_ipv6(int argc, char **argv, ascend_ipv6_filter_t *filter
 					return -1;
 				}
 			}
+			if (token > UINT8_MAX) {
+				fr_strerror_printf("IPv6 protocol \"%s\" is too large in IP data filter", argv[0]);
+				return -1;
+			}
 			filter->proto = token;
 			flags |= IP_PROTO_FLAG;
 
@@ -1108,10 +1119,13 @@ static int ascend_parse_generic(int argc, char **argv,
 		return -1;
 	}
 
-	slen = atoi(argv[0]);
-	if (slen > 65535) goto invalid;
+	{
+		unsigned long offset = strtoul(argv[0], NULL, 10);
 
-	filter->offset = slen;
+		if (offset > UINT16_MAX) goto invalid;
+
+		filter->offset = (uint16_t) offset;
+	}
 	filter->offset = htons(filter->offset);
 
 	slen = fr_base16_decode(NULL,
