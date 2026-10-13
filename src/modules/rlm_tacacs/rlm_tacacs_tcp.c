@@ -824,6 +824,16 @@ static void request_mux(fr_event_list_t *el,
 		tcp_request_t	*req;
 		request_t	*request;
 
+		/*
+		 *	TACACS+ sequence numbers are one byte.  A request assigned h->id 257
+		 *	stores 1 in req->id, and replaces the outstanding request in h->tracking[1].
+		 *	trunk_connection_signal_inactive() does not requeue the requests already
+		 *	queued on the connection.  The loop stops popping requests once h->id
+		 *	exceeds UINT8_MAX, and leaves the queued requests on the connection.
+		 *	The reconnect after the last outstanding reply requeues the queued requests.
+		 */
+		if (h->id > UINT8_MAX) break;
+
  		if (unlikely(trunk_connection_pop_request(&treq, tconn) < 0)) return;
 
 		/*
