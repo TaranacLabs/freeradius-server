@@ -198,6 +198,15 @@ ${2}: $$(addprefix $$(BUILD_DIR)/lib/local/,$$(CONFIG_LIBS.$(TEST)))
 endif
 endef
 
+#
+#  A dictionary with verify=lib on its PROTOCOL line fails to load when
+#  dlopen() cannot find libfreeradius-<protocol>.  The binaries which load
+#  dictionaries do not link against the protocol libraries.  Each binary
+#  gets an order-only prerequisite on every protocol library in this build.
+#
+PROTOCOL_LIBS := $(filter $(ALL_TGTS),$(patsubst %,libfreeradius-%.la,$(notdir $(patsubst %/,%,$(wildcard src/protocols/*/)))))
+$(addprefix $(TEST_BIN_DIR)/,radiusd radict unit_test_attribute unit_test_module): | $(addprefix $(BUILD_DIR)/lib/local/,$(PROTOCOL_LIBS))
+
 ######################################################################
 #
 #  Generic rules to set up the tests
