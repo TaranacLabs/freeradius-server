@@ -2785,6 +2785,11 @@ int main(int argc, char *argv[])
 
 		type = fr_pair_dcursor_by_da_init(&cursor, &conf->filter_request_vps, attr_packet_type);
 		if (type) {
+			if (!FR_RADIUS_PACKET_CODE_VALID(type->vp_uint32)) {
+				ERROR("Invalid Packet-Type %u in request filter", type->vp_uint32);
+				usage(64);
+			}
+
 			fr_dcursor_remove(&cursor);
 			conf->filter_request_code = type->vp_uint32;
 			talloc_free(type);
@@ -2799,6 +2804,11 @@ int main(int argc, char *argv[])
 
 		type = fr_pair_dcursor_by_da_init(&cursor, &conf->filter_response_vps, attr_packet_type);
 		if (type) {
+			if (!FR_RADIUS_PACKET_CODE_VALID(type->vp_uint32)) {
+				ERROR("Invalid Packet-Type %u in response filter", type->vp_uint32);
+				usage(64);
+			}
+
 			fr_dcursor_remove(&cursor);
 			conf->filter_response_code = type->vp_uint32;
 			talloc_free(type);
