@@ -1,0 +1,18 @@
+#
+#  PRE: if
+#
+#  The debug level is an int8_t, where -1 removes every log destination,
+#  and 0 removes the named one.  A level of 255 must be an error, rather
+#  than wrapping to -1.
+#
+if (%log.destination('test_null', 255)) {
+	test_fail
+}
+
+if (Module-Failure-Message[*] == 'Invalid debug level 255, expected 0 to 5') {
+	ok
+} else {
+	test_fail
+}
+
+success

@@ -1406,7 +1406,17 @@ static xlat_action_t xlat_func_log_dst(UNUSED TALLOC_CTX *ctx, UNUSED fr_dcursor
 	log = log_dst_by_name(dst->vb_strvalue);
 	if (!log) return XLAT_ACTION_FAIL;
 
-	if (lvl) level = lvl->vb_uint32;
+	if (lvl) {
+		/*
+		 *	request_log_prepend() takes an int8_t fr_log_lvl_t, and gives -1 and 0 their own
+		 *	meanings.  A larger value would wrap into one of them.
+		 */
+		if (lvl->vb_uint32 > L_DBG_LVL_MAX) {
+			REDEBUG("Invalid debug level %u, expected 0 to %u", lvl->vb_uint32, L_DBG_LVL_MAX);
+			return XLAT_ACTION_FAIL;
+		}
+		level = lvl->vb_uint32;
+	}
 
 	if (!file || ((log->dst != L_DST_NULL) && (log->dst != L_DST_FILES))) {
 		request_log_prepend(request, log, level);
