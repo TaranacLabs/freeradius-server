@@ -1,0 +1,9 @@
+#
+#	ARGV: -i 125 -c 1 -x -F
+#	IGNORE_ERROR: 1
+#
+#  Packet-Type in the input file sets the code of the request.  A
+#  value outside the range of RADIUS packet codes is an error.
+#
+Packet-Type = 300,
+User-Name = "bob"
