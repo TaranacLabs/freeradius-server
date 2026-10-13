@@ -1,0 +1,11 @@
+#
+#  control.EAP-Type is a uint32, and EAP types are one byte.  260 is
+#  not an EAP type, and must not be truncated to 4 (MD5).
+#
+#  The eap module selects the method in "authenticate eap", which
+#  rejects the request.  A truncated type starts MD5, and the reply is
+#  an Access-Challenge.
+#
+control.EAP-Type := 260
+
+eap
