@@ -84,6 +84,13 @@ static ssize_t encode_value(fr_dbuff_t *dbuff,
 
 	switch (da_stack->da[depth]->type) {
 	case FR_TYPE_ATTR:
+		/*
+		 *	Internal attributes are numbered from 256, and are not options.
+		 */
+		if (vp->vp_attr->attr > UINT8_MAX) {
+			fr_strerror_printf("%s: Attribute %s is not a DHCPv4 option", __FUNCTION__, vp->vp_attr->name);
+			return PAIR_ENCODE_FATAL_ERROR;
+		}
 		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t) vp->vp_attr->attr);
 		break;
 
