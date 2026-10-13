@@ -1,0 +1,18 @@
+#
+#  PRE: if
+#
+#  A redundant expansion calls the modules in the order of the redundant
+#  section, and stops at the first module which succeeds.  The xlat of
+#  rlm_always succeeds, and returns the status of the module instance.
+#
+#  The status of each instance is set first, so the result shows which
+#  instance the redundant expansion called.
+#
+%order_first('reject')
+%order_second('handled')
+
+if (%redundant_order() != 'handled') {
+	test_fail
+}
+
+success
