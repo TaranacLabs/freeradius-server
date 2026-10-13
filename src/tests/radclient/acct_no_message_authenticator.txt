@@ -1,0 +1,9 @@
+#
+#	ARGV: -i 124 -c 1 -x -F
+#
+#  "Message-Authenticator !* ANY" tells radclient to strip
+#  Message-Authenticator from the packet.  The packet must still be
+#  sent as an Accounting-Request.
+#
+User-Name = "bob",
+Message-Authenticator !* ANY
