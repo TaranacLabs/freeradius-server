@@ -261,6 +261,13 @@ static void test_gettoken_unescape(void)
 	TEST_PARSE(test_gettoken("\"a\\101b\"", true), T_DOUBLE_QUOTED_STRING, "aAb", 8);
 
 	/*
+	 *	Fewer than three octal digits, or a value above 0377, is not an octal escape.  The
+	 *	backslash yields the next character, and no character after the digits is lost.
+	 */
+	TEST_PARSE(test_gettoken("\"a\\1bc\"", true), T_DOUBLE_QUOTED_STRING, "a1bc", 7);
+	TEST_PARSE(test_gettoken("\"a\\777b\"", true), T_DOUBLE_QUOTED_STRING, "a777b", 8);
+
+	/*
 	 *	An escaped quote does not end the string.
 	 */
 	TEST_PARSE(test_gettoken("\"a\\\"b\"", true), T_DOUBLE_QUOTED_STRING, "a\"b", 6);
