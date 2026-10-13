@@ -2996,6 +2996,15 @@ static int dict_protocol_opts_parse(dict_protocol_opts_t *opts, char *options)
 				fr_strerror_printf("Found trailing garbage '%s' after format specifier", value);
 				return -1;
 			}
+
+			/*
+			 *	The same type sizes as VENDOR format=, and the ones fr_value_box_to_network()
+			 *	can encode for an attribute number.
+			 */
+			if ((opts->type_size != 1) && (opts->type_size != 2) && (opts->type_size != 4)) {
+				fr_strerror_printf("Invalid type size '%s' for PROTOCOL, expected 1, 2, or 4", value);
+				return -1;
+			}
 		}
 			break;
 

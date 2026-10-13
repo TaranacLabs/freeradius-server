@@ -1,0 +1,6 @@
+#
+#  PROTOCOL format=<n> takes the same type sizes as VENDOR format=,
+#  1, 2, or 4.  The type size is stored in a uint8_t, and 256 would
+#  be stored as 0.
+#
+PROTOCOL	Test-Format	250	format=256
