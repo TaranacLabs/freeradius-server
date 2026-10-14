@@ -649,6 +649,16 @@ define QUALIFY_PATH
 $(addprefix ${1}/,$(filter-out /%,${2})) $(filter /%,${2})
 endef
 
+# SHELL_QUOTE - Quote a value as one shell word.  Because a single quote cannot
+#   appear between single quotes, SHELL_QUOTE replaces each single quote in the
+#   value with '\''.  The replacement closes the quoted section, adds an
+#   escaped quote, and opens a new quoted section.
+#
+#   USE WITH CALL, $(call SHELL_QUOTE,<value>)
+define SHELL_QUOTE
+'$(subst ','\'',${1})'
+endef
+
 ###############################################################################
 #
 # Start of Makefile Evaluation
