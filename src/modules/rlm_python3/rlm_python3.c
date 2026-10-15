@@ -377,8 +377,7 @@ static void mod_vptuple(TALLOC_CTX *ctx, REQUEST *request, VALUE_PAIR **vps, PyO
 			       list_name, s1, fr_int2str(fr_tokens, op, "="), quote, s2p, quote);
 			radius_pairmove(current, vps, vp, false);
 		} else {
-			REDEBUG("FAILED converting attribute %s with value %s - %s",
-				s1, s2, fr_strerror());
+			REDEBUG("FAILED converting attribute %s - %s", s1, fr_strerror());
 			talloc_free(vp);
 		}
 	}
