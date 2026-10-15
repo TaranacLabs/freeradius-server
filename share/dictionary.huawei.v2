@@ -132,10 +132,6 @@ ATTRIBUTE	Huawei-HTTP-Redirect-URL		140	string
 ATTRIBUTE	Huawei-AP-Information			141	string
 ATTRIBUTE	Huawei-User-Information			142	string
 
-VALUE	Huawei-QoS-Profile-Type		Original		0
-VALUE	Huawei-QoS-Profile-Type		L2TP-Inbound		1
-VALUE	Huawei-QoS-Profile-Type		L2TP-Outbound		2
-VALUE	Huawei-QoS-Profile-Type		L2TP			3
 
 ATTRIBUTE	Huawei-Max-List-Num			143	integer
 ATTRIBUTE	Huawei-Acct-IPv6-Input-Octets		144	integer
@@ -151,7 +147,6 @@ ATTRIBUTE	Huawei-DNS-Server-IPv6-address		154	ipv6addr
 ATTRIBUTE	Huawei-URL-Flag				155	integer
 ATTRIBUTE	Huawei-Portal-UR			156	string
 ATTRIBUTE	Huawei-Terminal-Type			157	string
-ATTRIBUTE	Huawei-DHCP-Option			158	string
 ATTRIBUTE	Huawei-Acct-Update-Address		159	integer
 ATTRIBUTE	Huawei-UCL-Group			160	integer
 ATTRIBUTE	Huawei-Forwarding-VLAN			161	string
