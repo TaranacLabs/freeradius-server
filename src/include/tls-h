@@ -48,6 +48,18 @@ extern "C" {
 
 typedef struct fr_tls_server_conf_t fr_tls_server_conf_t;
 
+#define FR_TLS_CA_POLICY_KEY_LEN	(32)		//!< SHA-256 of the CA's SubjectPublicKeyInfo.
+#define FR_TLS_CA_POLICY_LOGGED_MAX	(64)		//!< Issuers remembered as logged, per store.
+#define FR_TLS_CA_POLICY_CRL		(1 << 0)	//!< The CA has a CRL: CRL errors stand.
+
+/** One parsed "ca_policy" line
+ *
+ */
+typedef struct fr_tls_ca_policy_t {
+	uint8_t		spki[FR_TLS_CA_POLICY_KEY_LEN];
+	uint32_t	flags;
+} fr_tls_ca_policy_t;
+
 typedef enum {
 	FR_TLS_INVALID = 0,	  		//!< Invalid, don't reply.
 	FR_TLS_REQUEST,       			//!< Request, ok to send, invalid to receive.
@@ -333,6 +345,9 @@ tls_session_t	*tls_new_client_session(TALLOC_CTX *ctx, fr_tls_server_conf_t *con
 fr_tls_server_conf_t *tls_server_conf_parse(CONF_SECTION *cs);
 fr_tls_server_conf_t *tls_client_conf_parse(CONF_SECTION *cs);
 fr_tls_server_conf_t *tls_server_conf_alloc(TALLOC_CTX *ctx);
+int		tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs);
+bool		tls_ca_policy_clears(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx, int err);
+void		tls_ca_policy_store_reset(fr_tls_server_conf_t *conf);
 SSL_CTX		*tls_init_ctx(fr_tls_server_conf_t *conf, int client, char const *chain_file, char const *private_key_file);
 int 		tls_handshake_recv(REQUEST *, tls_session_t *ssn);
 int 		tls_handshake_send(REQUEST *, tls_session_t *ssn);
@@ -402,6 +417,12 @@ struct fr_tls_server_conf_t {
 	uint32_t	ca_path_reload_interval;
 	uint32_t	ca_path_last_reload;
 	X509_STORE	*old_x509_store;
+
+	char const	*ca_policy;			//!< Only so that the parser marks every pair parsed.
+	fr_tls_ca_policy_t *ca_policy_entries;		//!< Parsed "ca_policy" lines, talloc child of conf.
+	uint32_t	ca_policy_num;
+	uint32_t	ca_policy_logged_num;		//!< Under mutex, reset when the store is re-created.
+	uint8_t		ca_policy_logged[FR_TLS_CA_POLICY_LOGGED_MAX][FR_TLS_CA_POLICY_KEY_LEN];
 	char const	*check_cert_cn;
 	char const	*cipher_list;
 	char const	*cipher_suites;

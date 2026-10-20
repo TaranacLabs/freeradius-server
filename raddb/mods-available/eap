@@ -369,6 +369,72 @@ eap {
 		#
 	#	allow_expired_crl = no
 
+		#  Per-CA revocation policy (Taranac fork).
+		#
+		#  With "check_crl = yes" alone, OpenSSL wants a CRL
+		#  from the issuer of EVERY client certificate, and
+		#  rejects clients of a CA which publishes none
+		#  (error 3, "unable to get certificate CRL").
+		#
+		#  "ca_policy" names the CAs which do have a CRL.  It
+		#  can be given any number of times:
+		#
+		#	ca_policy = "<sha256 of the CA's SPKI> crl"
+		#
+		#  The first token is the SHA-256, in 64 hex digits,
+		#  of the raw SubjectPublicKeyInfo of the CA
+		#  certificate: the bytes as they are in the
+		#  certificate, not a re-encoded public key.  E.g.
+		#  find the SPKI with "openssl asn1parse -in ca.pem -i"
+		#  (7th element of the TBSCertificate, at d=2), then
+		#  "openssl asn1parse -in ca.pem -offset <O> -length <hl+l>
+		#  -noout -out spki.der; sha256sum spki.der".  Re-issued
+		#  or cross-signed copies of a CA share its key, and so
+		#  its line.  The other tokens are flags.  The only
+		#  flag is "crl".
+		#
+		#  The rule is an OR over the chain up to its root: if
+		#  ANY certificate in it is listed, CRL errors stand, as
+		#  with plain "check_crl" (the leaf is checked against
+		#  the CRL of its issuer; a listed root does not make
+		#  its sub-CA's CRL optional).  OpenSSL ends the chain
+		#  at the first trusted CA, so the CAs above it are
+		#  looked up in the trusted CAs and count as well.  If
+		#  NONE is listed, only these "no usable CRL" errors are
+		#  cleared:
+		#
+		#	3 (unable to get CRL), 8 (CRL signature failure),
+		#	11 / 12 (CRL not yet valid / expired),
+		#	15 / 16 (bad CRL lastUpdate / nextUpdate),
+		#	33, 35, 36, 44, 54 (CRL issuer, usage, critical
+		#	extension, scope, CRL path)
+		#
+		#  Error 23 (certificate revoked) is NEVER cleared, and
+		#  neither is anything else: signatures, validity
+		#  dates, trust and purpose are checked as usual.
+		#  Clearing logs, once per issuer per X509 store:
+		#
+		#	(TLS) <name>: CRL not checked for '<subject>': no CA
+		#	in its chain has a CRL configured (issuer '<dn>',
+		#	issuer key sha256:<hex>)
+		#
+		#  Lines are parsed at startup.  A malformed line, an
+		#  unknown flag, a line without flags or a duplicate
+		#  key hash is a configuration error.  Without
+		#  "check_crl = yes" the lines have no effect (with a
+		#  warning).
+		#
+		#  Every server tls-config section logs, at INFO level,
+		#
+		#	tls: ca_policy: <N> entries
+		#
+		#  also when N is 0.  This line is a contract: it is how
+		#  Taranac tells a binary which understands "ca_policy"
+		#  from one which silently ignores it.  Do not change
+		#  its wording without Taranac.
+		#
+	#	ca_policy = "<64 hex digits> crl"
+
 		#  If check_cert_issuer is set, the value will
 		#  be checked against the DN of the issuer in
 		#  the client certificate.  If the values do not

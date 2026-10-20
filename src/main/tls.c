@@ -629,6 +629,7 @@ tls_session_t *tls_new_session(TALLOC_CTX *ctx, fr_tls_server_conf_t *conf, REQU
 				conf->ctx->cert_store = new_cert_store;
 #endif
 				conf->ca_path_last_reload = request->timestamp;
+				tls_ca_policy_store_reset(conf);
 			}
 		}
 		pthread_mutex_unlock(&conf->mutex);
@@ -1625,6 +1626,7 @@ static CONF_PARSER tls_server_config[] = {
 	{ "check_all_crl", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, fr_tls_server_conf_t, check_all_crl), "no" },
 #endif
 	{ "ca_path_reload_interval", FR_CONF_OFFSET(PW_TYPE_INTEGER, fr_tls_server_conf_t, ca_path_reload_interval), "0" },
+	{ "ca_policy", FR_CONF_OFFSET(PW_TYPE_STRING | PW_TYPE_MULTI, fr_tls_server_conf_t, ca_policy), NULL },
 	{ "allow_expired_crl", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, fr_tls_server_conf_t, allow_expired_crl), NULL },
 	{ "check_cert_cn", FR_CONF_OFFSET(PW_TYPE_STRING, fr_tls_server_conf_t, check_cert_cn), NULL },
 	{ "cipher_list", FR_CONF_OFFSET(PW_TYPE_STRING, fr_tls_server_conf_t, cipher_list), NULL },
@@ -3023,6 +3025,19 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 #endif
 
 	talloc_ctx = SSL_get_ex_data(ssl, FR_TLS_EX_INDEX_TALLOC);
+
+	/*
+	 *	A CRL error for a chain in which no CA has a CRL
+	 *	configured (ca_policy).  Return straight away: the
+	 *	attributes and the leaf checks below run when
+	 *	OpenSSL calls us again with ok = 1.  Not for the
+	 *	CRL path check (parent ctx), which has no SSL.
+	 */
+	if (!my_ok && conf->ca_policy_num && !X509_STORE_CTX_get0_parent_ctx(ctx) &&
+	    tls_ca_policy_clears(request, conf, ctx, err)) {
+		X509_STORE_CTX_set_error(ctx, X509_V_OK);
+		return 1;
+	}
 
 	/*
 	 *	Log client/issuing cert.  If there's an error, log
@@ -4893,6 +4908,8 @@ fr_tls_server_conf_t *tls_server_conf_parse(CONF_SECTION *cs)
 		talloc_free(conf);
 		return NULL;
 	}
+
+	if (tls_ca_policy_parse(conf, cs) < 0) goto error;
 
 	/*
 	 *	Save people from their own stupidity.
