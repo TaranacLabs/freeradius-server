@@ -1,7 +1,8 @@
 #!/bin/bash
 # ca_policy harness: runs radiusd (EAP-TLS, check_crl) against eapol_test on 127.0.0.1.
 #
-#   run.sh <workdir> [scenario ...]        default: all; "fast" = all but the SLOW 15 and 16
+#   run.sh <workdir> [scenario ...]        default: all; "fast" = all but the SLOW 15 and 16;
+#                                          "vg" = 4 5 8 9 with radiusd under valgrind (memcheck)
 #
 # Needs in PATH (or RADIUSD=/path): radiusd built from the ref under test, eapol_test,
 # openssl >= 3.0, python3.  Every scenario starts its own radiusd on its own port, so a
@@ -31,12 +32,19 @@ W=$(cd "$W" && pwd)
 RADIUSD=${RADIUSD:-radiusd}
 DICTDIR=${DICTDIR:-/usr/share/freeradius}
 LIBDIR=${LIBDIR:-/usr/lib/freeradius}
-ALL="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 15 16"
+ALL="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24 15 16"
+VALGRIND=${VALGRIND:-0}
 case "${*:-all}" in
 all)  SCEN=$ALL ;;
-fast) SCEN="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20" ;;
+fast) SCEN="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24" ;;
+vg)   SCEN="4 5 8 9"; VALGRIND=1 ;;
 *)    SCEN=$* ;;
 esac
+# eapol_test timeouts: a daemon under valgrind is many times slower
+ET_T=15; ET_TO=40; START_WAIT=100
+[ "$VALGRIND" = 1 ] && { ET_T=90; ET_TO=150; START_WAIT=900; }
+# the marker of the EAP tls-config (a binary without ca_policy prints none)
+MARK_RE='tls: ca_policy: [0-9]+ entries in tls-config tls-nac'
 
 now() { date +%s; }
 LOG=$W/run.log
@@ -72,11 +80,12 @@ cert() { # cert <name> -> path of a CA certificate
 	Rre) echo "$P/Rre/cert.pem" ;;
 	Sx)  echo "$P/Sx/cert.pem" ;;
 	Nn)  echo "$P/N-nonull/cert.pem" ;;
+	Lu)  echo "$P/leaf/u-ok.pem" ;;		# a client certificate, trusted directly
 	*)   echo "$P/$1/cert.pem" ;;
 	esac
 }
 declare -A H
-for c in R Rre S Sx U R2 P I E PSS N Nn SRV; do H[$c]=$(ref_spki "$(cert $c)") || { say "cannot hash $c"; exit 1; }; done
+for c in R Rre S Sx U R2 P I E PSS N Nn SRV A B Qold Qnew Sq Lu; do H[$c]=$(ref_spki "$(cert $c)") || { say "cannot hash $c"; exit 1; }; done
 
 # ---- result rows ------------------------------------------------------------------------------
 row() { # row <case> <expected> <actual> <PASS|FAIL|RECORD|INCONCLUSIVE>
@@ -248,11 +257,17 @@ port_of() { # one port block per scenario, so that background SLOW scenarios nev
 srv_start() { # srv_start <name>: D, PORT, SLOG; 0 = up
 	D=$W/sc-$1; PORT=$(port_of "$1"); SLOG=$D/radiusd.log
 	gen_conf "$D" "$PORT"
-	"$RADIUSD" -fxx -l stdout -d "$D/raddb" >"$SLOG" 2>&1 &
+	if [ "$VALGRIND" = 1 ]; then
+		valgrind --tool=memcheck --leak-check=full --show-leak-kinds=definite --errors-for-leak-kinds=definite \
+			--num-callers=30 --log-file="$D/valgrind.log" \
+			"$(command -v "$RADIUSD")" -fxx -l stdout -d "$D/raddb" >"$SLOG" 2>&1 &
+	else
+		"$RADIUSD" -fxx -l stdout -d "$D/raddb" >"$SLOG" 2>&1 &
+	fi
 	SPID=$!
 	T0=$(now)
 	local i
-	for i in $(seq 1 100); do
+	for i in $(seq 1 "$START_WAIT"); do
 		grep -q 'Ready to process requests' "$SLOG" && return 0
 		kill -0 "$SPID" 2>/dev/null || break
 		sleep 0.2
@@ -260,11 +275,24 @@ srv_start() { # srv_start <name>: D, PORT, SLOG; 0 = up
 	row "start" "radiusd running" "did not start: $(grep -E 'rror|ca_policy' "$SLOG" | tail -3 | tr '\n' ' ')" FAIL
 	return 1
 }
-srv_stop() { kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; }
+srv_stop() {
+	kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null
+	[ "$VALGRIND" = 1 ] && vg_check
+}
 
-# probe <label> <leaf> [extra CA cert name ...]: V = ACCEPT|REJECT, E = ",3,23,", PLOG = server log slice
-probe() {
-	local label=$1 leaf=$2 n0 c
+# valgrind: count the error and definite-leak records whose stack has our code in it
+vg_check() {
+	local f=$D/valgrind.log total ours
+	if [ ! -s "$f" ] || ! grep -q 'ERROR SUMMARY' "$f"; then row valgrind "memcheck report" "no ERROR SUMMARY in valgrind.log" FAIL; return; fi
+	total=$(sed -n 's/.*ERROR SUMMARY: \([0-9,]*\) errors.*/\1/p' "$f" | tail -1)
+	ours=$(gawk 'BEGIN { RS = "\n==[0-9]+== \n" } /tls_ca_policy|ca_policy_|cbtls_verify/ { n++ } END { print n + 0 }' "$f")
+	if [ "$ours" = 0 ]; then row valgrind "no memcheck record in ca_policy / cbtls_verify" "records in our code: 0 (ERROR SUMMARY: $total)" PASS
+	else row valgrind "no memcheck record in ca_policy / cbtls_verify" "records in our code: $ours (ERROR SUMMARY: $total)" FAIL; fi
+}
+
+# eapol_conf <label> <leaf> [extra CA cert name ...]: writes $D/<label>.eapol.conf
+eapol_conf() {
+	local label=$1 leaf=$2 c
 	shift 2
 	cat "$P/leaf/$leaf.pem" >"$D/$label.chain.pem"
 	for c in "$@"; do cat "$(cert "$c")" >>"$D/$label.chain.pem"; done
@@ -293,8 +321,14 @@ network={
 }
 C
 	fi
+}
+
+# probe <label> <leaf> [extra CA cert name ...]: V = ACCEPT|REJECT, E = ",3,23,", PLOG = server log slice
+probe() {
+	local label=$1 n0
+	eapol_conf "$@"
 	n0=$(wc -l <"$SLOG")
-	if timeout 40 eapol_test -c "$D/$label.eapol.conf" -a 127.0.0.1 -p "$PORT" -s testing123 -t 15 \
+	if timeout "$ET_TO" eapol_test -c "$D/$label.eapol.conf" -a 127.0.0.1 -p "$PORT" -s testing123 -t "$ET_T" \
 		>"$D/$label.eapol.log" 2>&1 && grep -q '^SUCCESS' "$D/$label.eapol.log"; then
 		V=ACCEPT
 	else
@@ -308,23 +342,33 @@ C
 
 got() { echo "$V err=${E#,}"; }
 
-expect_reject() { # expect_reject <case> <code>
-	if [ "$V" = REJECT ] && [[ $E == *,$2,* ]]; then row "$1" "Reject $2" "$(got)" PASS
-	else row "$1" "Reject $2" "$(got)" FAIL; fi
+expect_reject() { # expect_reject <case> <code> [regr]
+	# "regr": the same verdict on a binary without ca_policy -- a regression check, not evidence for the patch
+	local x="Reject $2"
+	[ "${3:-}" = regr ] && x="Reject $2 [regression]"
+	if [ "$V" = REJECT ] && [[ $E == *,$2,* ]]; then row "$1" "$x" "$(got)" PASS
+	else row "$1" "$x" "$(got)" FAIL; fi
+}
+expect_reject_any() { # expect_reject_any <case> "<code> <code>..."
+	local c
+	for c in $2; do [ "$V" = REJECT ] && [[ $E == *,$c,* ]] && { row "$1" "Reject ${2// / or }" "$(got)" PASS; return; }; done
+	row "$1" "Reject ${2// / or }" "$(got)" FAIL
 }
 expect_accept() { # expect_accept <case>
 	if [ "$V" = ACCEPT ]; then row "$1" "Accept" "$(got)" PASS; else row "$1" "Accept" "$(got)" FAIL; fi
 }
 warns_for() { grep -c "CRL not checked for .*issuer key sha256:$1)" "$SLOG"; }
+warns_direct() { grep -c "CRL not checked for .*trusted directly, its own key sha256:$1)" "$SLOG"; }
 expect_accept_unconf() { # expect_accept_unconf <case> <issuer CA name>
 	local w; w=$(warns_for "${H[$2]}")
 	if [ "$V" = ACCEPT ] && [ "$w" -ge 1 ]; then row "$1" "Accept + WARN for $2" "$(got) warn=$w" PASS
 	else row "$1" "Accept + WARN for $2" "$(got) warn=$w" FAIL; fi
 }
+marker_in() { grep -oE "$MARK_RE" "$1" | sort -u | tr '\n' ';'; }
 expect_marker() { # expect_marker <N>
-	local m; m=$(grep -o 'tls: ca_policy: [0-9]* entries' "$SLOG" | sort -u | tr '\n' ';')
-	if [ "$m" = "tls: ca_policy: $1 entries;" ]; then row marker "tls: ca_policy: $1 entries" "$m" PASS
-	else row marker "tls: ca_policy: $1 entries" "${m:-none}" FAIL; fi
+	local m x="tls: ca_policy: $1 entries in tls-config tls-nac"
+	m=$(marker_in "$SLOG")
+	if [ "$m" = "$x;" ]; then row marker "$x" "$m" PASS; else row marker "$x" "${m:-none}" FAIL; fi
 }
 
 xc() { # xc <name>: run radiusd -XC on a generated config, XC_RC, XC_LOG
@@ -337,13 +381,13 @@ xc() { # xc <name>: run radiusd -XC on a generated config, XC_RC, XC_LOG
 sc0() { # F1: -XC with valid lines exits 0 and prints the marker (an old binary: exit 0, no marker)
 	reset_conf; CA="R S U"; CRLS="S"; POLICY="${H[S]} ${H[U]}"
 	xc 0
-	local m; m=$(grep -o 'tls: ca_policy: [0-9]* entries' "$XC_LOG" | sort -u | tr '\n' ';')
-	if [ "$XC_RC" = 0 ] && [ "$m" = "tls: ca_policy: 2 entries;" ]; then row xc-valid "exit 0 + marker 2" "exit $XC_RC, ${m:-no marker}" PASS
+	local m; m=$(marker_in "$XC_LOG")
+	if [ "$XC_RC" = 0 ] && [ "$m" = "tls: ca_policy: 2 entries in tls-config tls-nac;" ]; then row xc-valid "exit 0 + marker 2" "exit $XC_RC, ${m:-no marker}" PASS
 	else row xc-valid "exit 0 + marker 2" "exit $XC_RC, ${m:-no marker}" FAIL; fi
 	reset_conf; CA="R S U"; CRLS="S"
 	xc 0n
-	m=$(grep -o 'tls: ca_policy: [0-9]* entries' "$XC_LOG" | sort -u | tr '\n' ';')
-	if [ "$XC_RC" = 0 ] && [ "$m" = "tls: ca_policy: 0 entries;" ]; then row xc-none "exit 0 + marker 0" "exit $XC_RC, ${m:-no marker}" PASS
+	m=$(marker_in "$XC_LOG")
+	if [ "$XC_RC" = 0 ] && [ "$m" = "tls: ca_policy: 0 entries in tls-config tls-nac;" ]; then row xc-none "exit 0 + marker 0" "exit $XC_RC, ${m:-no marker}" PASS
 	else row xc-none "exit 0 + marker 0" "exit $XC_RC, ${m:-no marker}" FAIL; fi
 }
 
@@ -352,7 +396,7 @@ sc1() { # no ca_policy: upstream behaviour
 	srv_start 1 || return
 	expect_marker 0
 	probe u-ok u-ok; expect_reject u-ok 3
-	probe s-rev s-rev; expect_reject s-rev 23
+	probe s-rev s-rev; expect_reject s-rev 23 regr
 	probe s-ok s-ok; expect_accept s-ok
 	srv_stop
 }
@@ -362,7 +406,7 @@ sc2() { # policy {S}: S chains checked, U chains not, one WARN for two U clients
 	srv_start 2 || return
 	expect_marker 1
 	probe s-ok s-ok; expect_accept s-ok
-	probe s-rev s-rev; expect_reject s-rev 23
+	probe s-rev s-rev; expect_reject s-rev 23 regr
 	probe u-ok-1 u-ok; expect_accept_unconf u-ok-1 U
 	probe u-ok-2 u-ok; expect_accept_unconf u-ok-2 U
 	local w; w=$(warns_for "${H[U]}")
@@ -397,13 +441,13 @@ sc5() { # three levels R2 -> P -> I
 	SC=5b; srv_start 5b || return
 	expect_marker 1
 	probe i-ok i-ok; expect_accept i-ok
-	probe i-rev i-rev; expect_reject i-rev 23
+	probe i-rev i-rev; expect_reject i-rev 23 regr
 	srv_stop
 	reset_conf; CA="R2 P I"; CRLS="P I"; POLICY="${H[P]} ${H[I]}"
 	SC=5c; srv_start 5c || return
 	expect_marker 2
 	probe i-ok i-ok; expect_accept i-ok
-	probe i-rev i-rev; expect_reject i-rev 23
+	probe i-rev i-rev; expect_reject i-rev 23 regr
 	srv_stop
 }
 
@@ -424,7 +468,7 @@ sc7() { # extra CA certificates sent by the client, off the path
 	reset_conf; CA="R S U"; CRLS="S"; POLICY="${H[S]}"
 	srv_start 7 || return
 	expect_marker 1
-	probe s-rev+U s-rev U; expect_reject s-rev+U 23
+	probe s-rev+U s-rev U; expect_reject s-rev+U 23 regr
 	probe u-ok+S u-ok S; expect_accept_unconf u-ok+S U
 	srv_stop
 }
@@ -446,7 +490,7 @@ sc9() { # path through the cross certificate S' (under U, not configured) still 
 	reset_conf; CA="R U"; CRLS="S"; POLICY="${H[S]}"
 	SC=9a; srv_start 9a || return
 	expect_marker 1
-	probe s-rev+Sx s-rev Sx; expect_reject s-rev+Sx 23
+	probe s-rev+Sx s-rev Sx; expect_reject s-rev+Sx 23 regr
 	srv_stop
 	reset_conf; CA="R U"; POLICY="${H[S]}"
 	SC=9b; srv_start 9b || return
@@ -470,8 +514,8 @@ sc10() { # configured CA, CRL expired / not yet valid
 
 sc11() { # malformed lines are configuration errors
 	local hs=${H[S]} i line
-	local -a bad=("zz${hs:2} crl" "${hs:1} crl" "$hs crl bogus" "$hs" "$hs crl=1")
-	local -a name=(not-hex 63-chars unknown-flag no-flags flag-value)
+	local -a bad=("zz${hs:2} crl" "${hs:1} crl" "$hs crl bogus" "$hs" "$hs crl=1" "" "   " "$hs CRL" "$hs crl crl")
+	local -a name=(not-hex 63-chars unknown-flag no-flags flag-value empty spaces-only upper-case-flag crl-twice)
 	for i in "${!bad[@]}"; do
 		reset_conf; CA="R S"; CRLS="S"; RAW_POLICY=("${bad[$i]}")
 		xc "11-$i"
@@ -488,13 +532,19 @@ sc11() { # malformed lines are configuration errors
 	else
 		row duplicate "-XC fails naming the line" "exit $XC_RC" FAIL
 	fi
+	# a tab is whitespace like a space: valid
+	reset_conf; CA="R S"; CRLS="S"; RAW_POLICY=("${hs}\\tcrl")
+	xc 11-tab
+	local m; m=$(marker_in "$XC_LOG")
+	if [ "$XC_RC" = 0 ] && [ "$m" = "tls: ca_policy: 1 entries in tls-config tls-nac;" ]; then row tab-separator "-XC exit 0 + marker 1" "exit $XC_RC, $m" PASS
+	else row tab-separator "-XC exit 0 + marker 1" "exit $XC_RC, ${m:-no marker}" FAIL; fi
 }
 
 sc12() { # delta CRL (the fork's delta fix) with a configured CA
 	reset_conf; CA="R S"; CRLS="S-base S-delta"; POLICY="${H[S]}"
 	srv_start 12 || return
 	expect_marker 1
-	probe s-drev s-drev; expect_reject s-drev 23
+	probe s-drev s-drev; expect_reject s-drev 23 regr
 	probe s-ok s-ok; expect_accept s-ok
 	srv_stop
 }
@@ -528,10 +578,15 @@ sc15() { # SLOW: the CRL is re-read with the store, and the WARN memory is reset
 	cp "$P/crl/S-revok.pem" "$D/crl/S.pem"
 	openssl rehash "$D/crl" >/dev/null 2>&1
 	probe s-ok-2 s-ok; row s-ok-before-reload "measured" "$(got)" RECORD
+	wait_until $((T0 + 285))
+	probe u-ok-pre u-ok
+	local w0; w0=$(warns_for "${H[U]}")
+	if [ "$V" = ACCEPT ] && [ "$w0" = 1 ]; then row u-ok-before-reload "Accept, still 1 WARN for U" "$(got) warn=$w0" PASS
+	else row u-ok-before-reload "Accept, still 1 WARN for U" "$(got) warn=$w0" FAIL; fi
 	wait_until $((T0 + 310))
 	probe s-ok-3 s-ok
 	if ! grep -q 'Flushing X509 store' "$SLOG"; then row reload "Flushing X509 store" "absent" INCONCLUSIVE; srv_stop; return; fi
-	expect_reject s-ok-after-reload 23
+	expect_reject s-ok-after-reload 23 regr
 	probe u-ok-2 u-ok; expect_accept_unconf u-ok-after-reload U
 	local w; w=$(warns_for "${H[U]}")
 	if [ "$w" = 2 ]; then row warn-again "2nd WARN for U after the reload" "$w" PASS; else row warn-again "2nd WARN for U after the reload" "$w" FAIL; fi
@@ -550,7 +605,7 @@ sc16() { # SLOW, measurement: a CRL file appearing in ca_path without a store re
 	wait_until $((T0 + 310))
 	probe s-rev-2 s-rev
 	if ! grep -q 'Flushing X509 store' "$SLOG"; then row reload "Flushing X509 store" "absent" INCONCLUSIVE; srv_stop; return; fi
-	expect_reject s-rev-after-reload 23
+	expect_reject s-rev-after-reload 23 regr
 	srv_stop
 }
 
@@ -628,6 +683,84 @@ sc20() { # characterisation of m4: OCSP on, U (not configured) with an OCSP resp
 		"$(got); $(grep -iE 'ocsp' "$PLOG" | grep -viE 'Creating attributes|^\s*$' | sed 's/^([0-9]*) //' | sort -u | head -4 | tr '\n' ' ')" RECORD
 	srv_stop
 	kill $opid 2>/dev/null; wait $opid 2>/dev/null
+}
+
+sc21() { # a loop of cross-certificates above the chain: the walk ends, the rule applies
+	reset_conf; CA="Ax Bx"; POLICY="${H[S]}"
+	SC=21a; srv_start 21a || return
+	expect_marker 1
+	probe x-ok x-ok; expect_accept_unconf x-ok A
+	srv_stop
+	reset_conf; CA="Ax Bx"; POLICY="${H[B]}"
+	SC=21b; srv_start 21b || return
+	expect_marker 1
+	probe x-ok x-ok; expect_reject x-ok 3
+	srv_stop
+}
+
+sc22() { # a root re-issued under the same DN with a new key; Sq has no AKID: every candidate counts
+	reset_conf; CA="Qold Qnew Sq"; POLICY="${H[Qnew]}"
+	SC=22a; srv_start 22a || return
+	expect_marker 1
+	probe q-ok q-ok; expect_reject q-ok-old-first 3
+	srv_stop
+	reset_conf; CA="Qnew Qold Sq"; POLICY="${H[Qnew]}"
+	SC=22b; srv_start 22b || return
+	expect_marker 1
+	probe q-ok q-ok; expect_reject q-ok-new-first 3
+	srv_stop
+	reset_conf; CA="Qold Qnew Sq"; POLICY="${H[U]}"
+	SC=22c; srv_start 22c || return
+	expect_marker 1
+	probe q-ok q-ok; expect_accept_unconf q-ok-control Sq
+	srv_stop
+}
+
+sc23() { # a chain of one: the client certificate itself is trusted
+	reset_conf; CA="Lu"; POLICY="${H[S]}"
+	SC=23a; srv_start 23a || return
+	expect_marker 1
+	probe u-ok u-ok
+	local w; w=$(warns_direct "${H[Lu]}")
+	if [ "$V" = ACCEPT ] && [ "$w" = 1 ]; then row u-ok-direct "Accept + WARN 'trusted directly' with the leaf key" "$(got) warn=$w" PASS
+	else row u-ok-direct "Accept + WARN 'trusted directly' with the leaf key" "$(got) warn=$w" FAIL; fi
+	srv_stop
+	reset_conf; CA="Lu U"; POLICY="${H[U]}"
+	SC=23b; srv_start 23b || return
+	expect_marker 1
+	probe u-ok u-ok; expect_reject_any u-ok-direct-under-listed-U "3 33"
+	srv_stop
+}
+
+sc24() { # 20 clients at once: right verdicts, exactly one WARN
+	reset_conf; CA="R S U"; CRLS="S"; POLICY="${H[S]}"
+	srv_start 24 || return
+	expect_marker 1
+	local i leaf pids="" ok_u=0 bad_u=0 rej_s=0 bad_s=0 w e23
+	for i in $(seq 1 20); do
+		leaf=u-ok; [ $((i % 4)) = 0 ] && leaf=s-rev
+		eapol_conf "par$i" "$leaf"
+		timeout "$ET_TO" eapol_test -c "$D/par$i.eapol.conf" -a 127.0.0.1 -p "$PORT" -s testing123 -t "$ET_T" \
+			>"$D/par$i.eapol.log" 2>&1 &
+		pids+=" $!"
+	done
+	wait $pids
+	sleep 0.5
+	for i in $(seq 1 20); do
+		if grep -q '^SUCCESS' "$D/par$i.eapol.log"; then
+			if [ $((i % 4)) = 0 ]; then bad_s=$((bad_s + 1)); else ok_u=$((ok_u + 1)); fi
+		else
+			if [ $((i % 4)) = 0 ]; then rej_s=$((rej_s + 1)); else bad_u=$((bad_u + 1)); fi
+		fi
+	done
+	w=$(warns_for "${H[U]}")
+	e23=$(grep -c 'OpenSSL says error 23' "$SLOG")
+	if [ "$ok_u" = 15 ]; then row parallel-u-ok "15 x u-ok Accept" "$ok_u Accept, $bad_u Reject" PASS
+	else row parallel-u-ok "15 x u-ok Accept" "$ok_u Accept, $bad_u Reject" FAIL; fi
+	if [ "$rej_s" = 5 ] && [ "$e23" -ge 5 ]; then row parallel-s-rev "5 x s-rev Reject 23" "$rej_s Reject, $bad_s Accept, error-23 lines $e23" PASS
+	else row parallel-s-rev "5 x s-rev Reject 23" "$rej_s Reject, $bad_s Accept, error-23 lines $e23" FAIL; fi
+	if [ "$w" = 1 ]; then row parallel-warn "exactly 1 WARN for U" "$w" PASS; else row parallel-warn "exactly 1 WARN for U" "$w" FAIL; fi
+	srv_stop
 }
 
 # ---- driver -----------------------------------------------------------------------------------

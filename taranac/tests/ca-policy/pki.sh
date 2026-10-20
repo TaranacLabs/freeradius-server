@@ -10,6 +10,8 @@
 #   E  (EC, compressed point) -> e-ok                  non-standard SPKI encodings, each with an
 #   PSS (RSA-PSS key)        -> pss-ok                 expired CRL; N-nonull is N with the NULL
 #   N  (RSA), N-nonull       -> n-ok                   parameters dropped from its SPKI algorithm
+#   A <-> B: A' = A cross-signed by B, B' = B cross-signed by A (a loop) -> x-ok issued by A
+#   Qold, Qnew: two roots with the same DN and different keys -> Sq (issued by Qnew, NO AKID) -> q-ok
 #   SRV -> server                                      the server's own chain, never trusted for clients
 #
 # CRL files go to crl/<name>.pem; the harness copies the ones a scenario needs into its ca_path.
@@ -51,6 +53,11 @@ basicConstraints = critical,CA:true
 keyUsage = critical,keyCertSign,cRLSign
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid
+[ v3_ca_noakid ]
+basicConstraints = critical,CA:true
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = none
 [ v3_root ]
 basicConstraints = critical,CA:true
 keyUsage = critical,keyCertSign,cRLSign
@@ -200,6 +207,24 @@ crl N N-expired "$(ago 864000)" "$(ago 86400)"
 mkdir -p N-nonull
 python3 -I "$HERE/spki.py" strip-null N/cert.pem N-nonull/cert.pem
 
+# ---- loop of cross-certificates A <-> B (scenario 21) ----------------------------------------
+root A "CAPOL Loop A" ec
+root B "CAPOL Loop B" ec
+run openssl req -new -key A/key.pem -out A/csr.pem -subj "/CN=CAPOL Loop A" -config A/ca.cnf
+run openssl req -new -key B/key.pem -out B/csr.pem -subj "/CN=CAPOL Loop B" -config B/ca.cnf
+mkdir -p Ax Bx
+run openssl ca -batch -config B/ca.cnf -extensions v3_ca -in A/csr.pem -out Ax/cert.pem -notext -days 1825
+run openssl ca -batch -config A/ca.cnf -extensions v3_ca -in B/csr.pem -out Bx/cert.pem -notext -days 1825
+leaf A x-ok
+
+# ---- a root re-issued under the same DN with a new key (scenario 22) ----------------------------
+root Qold "CAPOL Root Q" ec
+root Qnew "CAPOL Root Q" ec
+mkca Sq; newkey Sq/key.pem ec
+run openssl req -new -key Sq/key.pem -out Sq/csr.pem -subj "/CN=CAPOL Issuing Sq" -config Sq/ca.cnf
+run openssl ca -batch -config Qnew/ca.cnf -extensions v3_ca_noakid -in Sq/csr.pem -out Sq/cert.pem -notext -days 1825
+leaf Sq q-ok
+
 # ---- OCSP responder for U (scenario 20) ---------------------------------------------------------
 newkey leaf/ocsp-u.key ec
 run openssl req -new -key leaf/ocsp-u.key -out leaf/ocsp-u.csr -subj "/CN=CAPOL OCSP U" -config U/ca.cnf
@@ -229,6 +254,12 @@ openssl verify -no-CApath -CAfile rs.pem -crl_check -CRLfile crl/S-base.pem -CRL
 openssl verify -no-CApath -CAfile rs.pem -crl_check -use_deltas -CRLfile crl/S-base.pem -CRLfile crl/S-delta.pem leaf/s-drev.pem 2>&1 \
 	| grep -q 'certificate revoked' || fail "delta CRL does not revoke s-drev"
 openssl verify -no-CApath -CAfile rs.pem -crl_check -CRLfile crl/S-notyet.pem leaf/s-ok.pem 2>&1 | grep -q 'error 11 ' || fail "S-notyet is not error 11"
+openssl x509 -in Sq/cert.pem -noout -ext authorityKeyIdentifier 2>/dev/null | grep -q keyid && fail "Sq has an AKID"
+openssl verify -no-CApath -CAfile Qnew/cert.pem -untrusted Sq/cert.pem leaf/q-ok.pem 2>&1 | grep -q ': OK$' || fail "q-ok does not verify under Qnew"
+openssl verify -no-CApath -CAfile Qold/cert.pem -untrusted Sq/cert.pem leaf/q-ok.pem 2>&1 | grep -q ': OK$' && fail "q-ok verifies under Qold"
+[ "$(h Qold/cert.pem)" != "$(h Qnew/cert.pem)" ] || fail "Qold and Qnew share a key"
+[ "$(openssl x509 -in Ax/cert.pem -noout -issuer)" = "issuer=CN=CAPOL Loop B" ] || fail "A' not issued by B"
+[ "$(openssl x509 -in Bx/cert.pem -noout -issuer)" = "issuer=CN=CAPOL Loop A" ] || fail "B' not issued by A"
 rm -f u.pem rs.pem .last.log
 chmod -R a+rX "$P"
 echo "pki: OK ($(ls leaf/*.pem | wc -l) leaf certs, $(ls crl | wc -l) CRLs)"
