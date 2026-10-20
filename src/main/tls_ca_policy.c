@@ -46,6 +46,7 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 #  define X509_STORE_CTX_get0_chain(_ctx) X509_STORE_CTX_get_chain(_ctx)
+#  define X509_STORE_CTX_get1_certs(_ctx, _nm) X509_STORE_get1_certs(_ctx, _nm)
 #endif
 
 /** Hash the SubjectPublicKeyInfo of a certificate exactly as it was encoded in it
@@ -147,6 +148,13 @@ static int ca_policy_entry_parse(fr_tls_ca_policy_t *entry, char const *value)
 	return 0;
 }
 
+/*
+ *	X509_STORE_CTX ex_data: set when a CRL error was cleared during this
+ *	verification, so that the warning is logged only once the chain has
+ *	verified (see tls_ca_policy_verified()).
+ */
+static int ca_policy_ex_index = -1;
+
 static fr_tls_ca_policy_t const *ca_policy_find(fr_tls_server_conf_t const *conf, uint8_t const *spki, uint32_t flag)
 {
 	uint32_t i;
@@ -166,10 +174,13 @@ static fr_tls_ca_policy_t const *ca_policy_find(fr_tls_server_conf_t const *conf
  * The table entry in tls_server_config[] only marks the pairs as parsed
  * (PW_TYPE_MULTI stores the first value alone), so walk them here.
  *
- * Always prints "tls: ca_policy: <N> entries", also for N == 0.  The line is
- * at INFO level, so it shows in "radiusd -XC" and in production logs alike:
- * it is how a consumer tells a binary which understands "ca_policy" from one
- * which silently ignores it (an unknown pair is only reported at debug level 3).
+ * Always prints "tls: ca_policy: <N> entries in <section>", also for N == 0,
+ * for every server TLS configuration parsed: an EAP tls-config, and also a
+ * "tls" subsection of a listen or a client section.  <section> is the name
+ * of the section, e.g. "tls-config tls-nac".  The line is at INFO level, so
+ * it shows in "radiusd -XC" and in production logs alike: it is how a
+ * consumer tells a binary which understands "ca_policy" from one which
+ * silently ignores it (an unknown pair is only reported at debug level 3).
  * Do not change its wording without the consumers.
  *
  * @return 0 on success, -1 on a malformed or duplicate line.
@@ -178,6 +189,7 @@ int tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs)
 {
 	CONF_PAIR	*cp;
 	uint32_t	n = 0, i = 0, j;
+	char const	*name2;
 
 	for (cp = cf_pair_find(cs, "ca_policy"); cp; cp = cf_pair_find_next(cs, cp, "ca_policy")) n++;
 
@@ -186,6 +198,18 @@ int tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs)
 		if (!conf->ca_policy_entries) {
 			ERROR(LOG_PREFIX ": Out of memory");
 			return -1;
+		}
+
+		/*
+		 *	Configuration is parsed before the worker threads
+		 *	exist, so a plain check is enough here.
+		 */
+		if (ca_policy_ex_index < 0) {
+			ca_policy_ex_index = X509_STORE_CTX_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+			if (ca_policy_ex_index < 0) {
+				ERROR(LOG_PREFIX ": Failed allocating ex_data index for ca_policy");
+				return -1;
+			}
 		}
 	}
 
@@ -213,7 +237,8 @@ int tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs)
 	}
 	conf->ca_policy_num = n;
 
-	INFO(LOG_PREFIX ": ca_policy: %u entries", n);
+	name2 = cf_section_name2(cs);
+	INFO(LOG_PREFIX ": ca_policy: %u entries in %s%s%s", n, cf_section_name1(cs), name2 ? " " : "", name2 ? name2 : "");
 
 	if (n && !conf->check_crl) {
 		WARN(LOG_PREFIX ": ca_policy has no effect without check_crl = yes");
@@ -295,129 +320,225 @@ void tls_ca_policy_store_reset(fr_tls_server_conf_t *conf)
 
 /** Hash a certificate's key and look it up
  *
- * @return 1 listed with "crl", 0 not listed, -1 the key cannot be hashed.
+ * @return 1 listed with the flag, 0 not listed, -1 the key cannot be hashed.
  */
 static int ca_policy_cert_listed(REQUEST *request, fr_tls_server_conf_t const *conf, X509 *cert, int depth,
-				 uint8_t spki[FR_TLS_CA_POLICY_KEY_LEN])
+				 uint32_t flag)
 {
-	char hex[(FR_TLS_CA_POLICY_KEY_LEN * 2) + 1];
+	uint8_t	spki[FR_TLS_CA_POLICY_KEY_LEN];
+	char	hex[(FR_TLS_CA_POLICY_KEY_LEN * 2) + 1];
 
 	if (!cert || (ca_policy_spki_sha256(cert, spki) < 0)) {
-		RDEBUG2("(TLS) %s - ca_policy: cannot hash the key of certificate %d in chain, CRL check stays",
-			conf->name, depth);
+		RDEBUG2("(TLS) %s - ca_policy: cannot hash the key of certificate %d in chain", conf->name, depth);
 		return -1;
 	}
 
-	if (!ca_policy_find(conf, spki, FR_TLS_CA_POLICY_CRL)) return 0;
+	if (!ca_policy_find(conf, spki, flag)) return 0;
 
-	fr_bin2hex(hex, spki, FR_TLS_CA_POLICY_KEY_LEN);
-	RDEBUG2("(TLS) %s - ca_policy: certificate %d in chain (key sha256:%s) has a CRL configured, CRL check stays",
-		conf->name, depth, hex);
+	fr_bin2hex(hex, spki, sizeof(spki));
+	RDEBUG2("(TLS) %s - ca_policy: certificate %d in chain (key sha256:%s) is listed", conf->name, depth, hex);
 
 	return 1;
 }
 
+/** Look at every CA in the trust store which may have issued a certificate
+ *
+ * Several CA certificates can have the issuer's DN, e.g. a root re-issued
+ * with a new key under the same name.  Without an AKID in the certificate,
+ * nothing tells them apart short of checking the signature, so every
+ * candidate which X509_check_issued() accepts counts: OR over all of them.
+ *
+ * @return 1 one of them is listed with the flag, 0 none is, -1 error.
+ */
+static int ca_policy_issuers_listed(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx,
+				    X509 *cert, int depth, uint32_t flag)
+{
+	STACK_OF(X509)	*candidates;
+	int		i, rcode = 0;
+
+	candidates = X509_STORE_CTX_get1_certs(ctx, X509_get_issuer_name(cert));
+	if (!candidates) return 0;
+
+	for (i = 0; i < sk_X509_num(candidates); i++) {
+		X509 *candidate = sk_X509_value(candidates, i);
+
+		if (X509_check_issued(candidate, cert) != X509_V_OK) continue;
+
+		rcode = ca_policy_cert_listed(request, conf, candidate, depth, flag);
+		if (rcode != 0) break;
+	}
+	sk_X509_pop_free(candidates, X509_free);
+
+	return rcode;
+}
+
 /*
- *	How far above the verified chain we look for CAs, see below.
+ *	How far above the verified chain we look for CAs.  It also ends
+ *	loops of cross-certificates (A issued by B, B issued by A).
  */
 #define CA_POLICY_MAX_WALK (16)
 
-/** Decide whether a CRL error for this chain is cleared by the policy
+/** Is any certificate in the chain, up to its root, listed with a flag
  *
- * The rule is an OR over the chain up to its root: if any certificate in
- * it, leaf included (so that a chain of one has an answer), has its key
- * listed with "crl", the error stands.  Otherwise a "no usable CRL" error
- * is cleared.  Adding a line can therefore only make checking stricter.
- *
- * The key of a certificate's real issuer is always in the chain at depth 1,
- * whichever path (original, re-issued or cross-signed CA certificate)
- * OpenSSL built, because the leaf signature is verified with it.
+ * The chain is the verified one, leaf included (so that a chain of one has
+ * an answer).  The key of a certificate's real issuer is always in it at
+ * depth 1, whichever path (original, re-issued or cross-signed CA
+ * certificate) OpenSSL built, because the leaf signature is verified with it.
  *
  * FreeRADIUS sets X509_V_FLAG_PARTIAL_CHAIN, so OpenSSL ends the verified
  * chain at the first certificate it finds in the trust store.  With the
  * intermediate CAs in ca_file that is usually the issuing CA itself, and
- * the CAs above it are not in X509_STORE_CTX_get0_chain().  A listed root
- * would then not cover the leaves of its sub-CAs, so we carry on from the
- * top of the chain through the trust store, issuer by issuer, up to a
- * self-issued certificate.  This only ever adds certificates, so it can
- * only make checking stricter.  Above depth 1 the result depends on the
- * path, as it does in OpenSSL's own chain.
+ * the CAs above it are not in X509_STORE_CTX_get0_chain().  So we carry on
+ * from the top of the chain through the trust store: at each level every
+ * candidate issuer counts (see ca_policy_issuers_listed()), and the walk
+ * goes on through the one X509_STORE_CTX_get1_issuer() picks (DN, AKID
+ * against SKID, key usage, validity; no signature check), until a
+ * self-issued certificate, a certificate without an issuer in the store,
+ * or CA_POLICY_MAX_WALK levels.  This only ever adds certificates, so it
+ * can only find more listed CAs, never fewer.  Above depth 1 the result
+ * depends on the path, as it does in OpenSSL's own chain.
  *
- * Any failure to hash a certificate or to look up an issuer keeps the
- * error: fail closed.
+ * Any failure to hash a certificate or to look up an issuer is returned as
+ * an error: callers must treat it as "listed" (fail closed).
+ *
+ * Not CRL specific: the OCSP per-CA flags are meant to use it too.
+ *
+ * @return 1 listed, 0 not listed, -1 error.
+ */
+int tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx, uint32_t flag)
+{
+	STACK_OF(X509)	*chain;
+	X509		*top, *owned = NULL;
+	int		i, num, rcode = 0;
+
+	chain = X509_STORE_CTX_get0_chain(ctx);
+	if (!chain) return -1;
+
+	num = sk_X509_num(chain);
+	if (num <= 0) return -1;
+
+	for (i = 0; i < num; i++) {
+		rcode = ca_policy_cert_listed(request, conf, sk_X509_value(chain, i), i, flag);
+		if (rcode != 0) return rcode;
+	}
+
+	/*
+	 *	Above the verified chain, through the trust store.  The
+	 *	lookups may leave errors on the OpenSSL error queue, which
+	 *	must not be mistaken for errors of the handshake.
+	 */
+	ERR_set_mark();
+	top = sk_X509_value(chain, num - 1);
+	for (i = num; i < (num + CA_POLICY_MAX_WALK); i++) {
+		X509	*up = NULL;
+		int	found;
+
+		if (X509_check_issued(top, top) == X509_V_OK) break;	/* self-issued: a root */
+
+		rcode = ca_policy_issuers_listed(request, conf, ctx, top, i, flag);
+		if (rcode != 0) break;
+
+		found = X509_STORE_CTX_get1_issuer(&up, ctx, top);
+		if (found == 0) break;					/* not in the trust store */
+		if ((found < 0) || !up) {
+			RDEBUG2("(TLS) %s - ca_policy: error looking up the issuer of certificate %d in chain",
+				conf->name, i - 1);
+			rcode = -1;
+			break;
+		}
+
+		if (X509_cmp(up, top) == 0) {				/* its own issuer, but not self-issued */
+			X509_free(up);
+			break;
+		}
+
+		X509_free(owned);
+		owned = top = up;
+	}
+	X509_free(owned);
+	ERR_pop_to_mark();
+
+	return rcode;
+}
+
+/** Decide whether a CRL error for this chain is cleared by the policy
+ *
+ * If any certificate in the chain up to its root is listed with "crl", the
+ * error stands.  Otherwise a "no usable CRL" error is cleared.  Adding a
+ * line can therefore only make checking stricter.  An error while looking
+ * keeps the error: fail closed.
+ *
+ * Nothing is logged at WARN level here: the chain has not been verified yet
+ * (signatures come after the CRL check), so whatever it says is the
+ * client's.  The clearing is remembered in the X509_STORE_CTX and logged by
+ * tls_ca_policy_verified() once the chain has verified.
  *
  * @return true if the caller should clear the error and carry on.
  */
 bool tls_ca_policy_clears(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx, int err)
 {
-	STACK_OF(X509)	*chain;
-	X509		*cert, *top, *owned = NULL;
-	int		i, num, issuer_depth, rcode;
-	uint8_t		spki[FR_TLS_CA_POLICY_KEY_LEN];
-	uint8_t		issuer_spki[FR_TLS_CA_POLICY_KEY_LEN] = { 0 };
-	char		subject[1024], issuer[1024];
-	char		hex[(FR_TLS_CA_POLICY_KEY_LEN * 2) + 1];
-
 	if (!ca_policy_error_clearable(err)) return false;
 
-	chain = X509_STORE_CTX_get0_chain(ctx);
-	if (!chain) return false;
-
-	num = sk_X509_num(chain);
-	if (num <= 0) return false;
-
-	issuer_depth = (num > 1) ? 1 : 0;
-
-	for (i = 0; i < num; i++) {
-		if (ca_policy_cert_listed(request, conf, sk_X509_value(chain, i), i, spki) != 0) return false;
-
-		if (i == issuer_depth) memcpy(issuer_spki, spki, sizeof(issuer_spki));
+	if (tls_ca_policy_chain_has(request, conf, ctx, FR_TLS_CA_POLICY_CRL) != 0) {
+		RDEBUG2("(TLS) %s - ca_policy: CRL check stays", conf->name);
+		return false;
 	}
-
-	/*
-	 *	Above the verified chain, through the trust store.
-	 */
-	top = sk_X509_value(chain, num - 1);
-	for (i = num; i < (num + CA_POLICY_MAX_WALK); i++) {
-		X509 *up = NULL;
-
-		if (X509_check_issued(top, top) == X509_V_OK) break;	/* self-issued: a root */
-
-		rcode = X509_STORE_CTX_get1_issuer(&up, ctx, top);
-		if (rcode == 0) break;					/* not in the trust store */
-		if ((rcode < 0) || !up) {
-			RDEBUG2("(TLS) %s - ca_policy: error looking up the issuer of certificate %d in chain, "
-				"CRL check stays", conf->name, i - 1);
-			X509_free(owned);
-			return false;
-		}
-
-		X509_free(owned);
-		owned = top = up;
-
-		if (ca_policy_cert_listed(request, conf, top, i, spki) != 0) {
-			X509_free(owned);
-			return false;
-		}
-	}
-	X509_free(owned);
-
-	subject[0] = issuer[0] = '\0';
-	cert = sk_X509_value(chain, 0);
-	X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject));
-	subject[sizeof(subject) - 1] = '\0';
-	X509_NAME_oneline(X509_get_subject_name(sk_X509_value(chain, issuer_depth)), issuer, sizeof(issuer));
-	issuer[sizeof(issuer) - 1] = '\0';
-	fr_bin2hex(hex, issuer_spki, sizeof(issuer_spki));
 
 	RDEBUG2("(TLS) %s - ca_policy: no CA in the chain has a CRL configured, clearing OpenSSL error %d : %s",
 		conf->name, err, X509_verify_cert_error_string(err));
 
-	if (!ca_policy_logged(conf, issuer_spki)) {
-		WARN("(TLS) %s: CRL not checked for '%s': no CA in its chain has a CRL configured "
-		     "(issuer '%s', issuer key sha256:%s)", conf->name, subject, issuer, hex);
-	}
+	if (ca_policy_ex_index >= 0) X509_STORE_CTX_set_ex_data(ctx, ca_policy_ex_index, &ca_policy_ex_index);
 
 	return true;
+}
+
+/** Log a cleared CRL check, once the chain has verified
+ *
+ * Called for depth 0 with ok = 1, i.e. after OpenSSL verified the
+ * signatures of the whole chain.  Logs once per issuer key per X509 store.
+ * A chain of one (a client certificate trusted directly) is logged with
+ * the certificate's own key, as it has no issuer in the chain.
+ */
+void tls_ca_policy_verified(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx)
+{
+	STACK_OF(X509)	*chain;
+	X509		*leaf, *key_cert;
+	int		num;
+	uint8_t		spki[FR_TLS_CA_POLICY_KEY_LEN];
+	char		subject[1024], issuer[1024];
+	char		hex[(FR_TLS_CA_POLICY_KEY_LEN * 2) + 1];
+
+	if ((ca_policy_ex_index < 0) || !X509_STORE_CTX_get_ex_data(ctx, ca_policy_ex_index)) return;
+	X509_STORE_CTX_set_ex_data(ctx, ca_policy_ex_index, NULL);
+
+	chain = X509_STORE_CTX_get0_chain(ctx);
+	if (!chain || ((num = sk_X509_num(chain)) <= 0)) return;
+
+	leaf = sk_X509_value(chain, 0);
+	key_cert = (num > 1) ? sk_X509_value(chain, 1) : leaf;
+
+	subject[0] = issuer[0] = '\0';
+	X509_NAME_oneline(X509_get_subject_name(leaf), subject, sizeof(subject));
+	subject[sizeof(subject) - 1] = '\0';
+
+	if (ca_policy_spki_sha256(key_cert, spki) < 0) {
+		WARN("(TLS) %s: CRL not checked for '%s': no CA in its chain has a CRL configured", conf->name, subject);
+		return;
+	}
+	if (ca_policy_logged(conf, spki)) return;
+
+	fr_bin2hex(hex, spki, sizeof(spki));
+	if (num == 1) {
+		WARN("(TLS) %s: CRL not checked for '%s': no CA in its chain has a CRL configured "
+		     "(certificate trusted directly, its own key sha256:%s)", conf->name, subject, hex);
+		return;
+	}
+
+	X509_NAME_oneline(X509_get_subject_name(key_cert), issuer, sizeof(issuer));
+	issuer[sizeof(issuer) - 1] = '\0';
+	WARN("(TLS) %s: CRL not checked for '%s': no CA in its chain has a CRL configured "
+	     "(issuer '%s', issuer key sha256:%s)", conf->name, subject, issuer, hex);
+
+	RDEBUG2("(TLS) %s - ca_policy: CRL check was cleared for this chain", conf->name);
 }
 #endif	/* WITH_TLS */
