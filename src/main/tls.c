@@ -3030,8 +3030,12 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 	 *	A CRL error for a chain in which no CA has a CRL
 	 *	configured (ca_policy).  Return straight away: the
 	 *	attributes and the leaf checks below run when
-	 *	OpenSSL calls us again with ok = 1.  Not for the
-	 *	CRL path check (parent ctx), which has no SSL.
+	 *	OpenSSL calls us again with ok = 1.
+	 *
+	 *	The parent ctx test is defensive only: a child ctx
+	 *	exists for the CRL path check, which needs OpenSSL's
+	 *	EXTENDED_CRL_SUPPORT (not built by default), and
+	 *	has no SSL, so we would not have got this far.
 	 */
 	if (!my_ok && conf->ca_policy_num && !X509_STORE_CTX_get0_parent_ctx(ctx) &&
 	    tls_ca_policy_clears(request, conf, ctx, err)) {
@@ -3262,6 +3266,12 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 
 		return my_ok;
 	}
+
+	/*
+	 *	The whole chain has verified: log a CRL check which
+	 *	ca_policy cleared earlier in this verification.
+	 */
+	if ((depth == 0) && conf->ca_policy_num) tls_ca_policy_verified(request, conf, ctx);
 
 	if (lookup == 0) {
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)

@@ -347,6 +347,9 @@ fr_tls_server_conf_t *tls_client_conf_parse(CONF_SECTION *cs);
 fr_tls_server_conf_t *tls_server_conf_alloc(TALLOC_CTX *ctx);
 int		tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs);
 bool		tls_ca_policy_clears(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx, int err);
+void		tls_ca_policy_verified(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx);
+int		tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx,
+					uint32_t flag);
 void		tls_ca_policy_store_reset(fr_tls_server_conf_t *conf);
 SSL_CTX		*tls_init_ctx(fr_tls_server_conf_t *conf, int client, char const *chain_file, char const *private_key_file);
 int 		tls_handshake_recv(REQUEST *, tls_session_t *ssn);
