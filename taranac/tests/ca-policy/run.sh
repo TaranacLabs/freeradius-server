@@ -533,7 +533,7 @@ sc11() { # malformed lines are configuration errors
 		row duplicate "-XC fails naming the line" "exit $XC_RC" FAIL
 	fi
 	# a tab is whitespace like a space: valid
-	reset_conf; CA="R S"; CRLS="S"; RAW_POLICY=("${hs}\\tcrl")
+	reset_conf; CA="R S"; CRLS="S"; RAW_POLICY=("${hs}"$'\t'"crl")
 	xc 11-tab
 	local m; m=$(marker_in "$XC_LOG")
 	if [ "$XC_RC" = 0 ] && [ "$m" = "tls: ca_policy: 1 entries in tls-config tls-nac;" ]; then row tab-separator "-XC exit 0 + marker 1" "exit $XC_RC, $m" PASS
