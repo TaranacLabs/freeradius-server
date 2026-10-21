@@ -1430,12 +1430,29 @@ static int mod_detach(void *instance)
  *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
+ *
+ *	This module does not modify its instantiation data on the request
+ *	path, so it is declared thread-safe. Each worker thread gets its own
+ *	PyThreadState per instance (the thread-local tree in do_python()),
+ *	every call into Python is bracketed by PyEval_RestoreThread() /
+ *	PyEval_SaveThread(), and the interpreter's GIL serialises Python code
+ *	itself. The globals current_inst / current_conf / main_module are only
+ *	touched by instantiate and detach, which run on the main thread before
+ *	the worker pool starts and after it has been joined.
+ *
+ *	The THREAD_UNSAFE flag dated from 2018, set on the Python 2 rlm_python
+ *	"due to reports of issues" before per-thread states and cext_compat
+ *	existed, and was copied here unchanged. With it every call into one
+ *	instance (authorize, authenticate, accounting, post-auth) took the same
+ *	mutex, so one Python function that waited -- an MFA push waiting for the
+ *	user to approve it -- stopped every other request that reached the same
+ *	instance until it returned.
  */
 extern module_t rlm_python3;
 module_t rlm_python3 = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "python3",
-	.type		= RLM_TYPE_THREAD_UNSAFE,
+	.type		= RLM_TYPE_THREAD_SAFE,
 	.inst_size	= sizeof(rlm_python_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,
