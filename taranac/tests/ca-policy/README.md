@@ -8,7 +8,7 @@ Tests for the fork's per-CA revocation policy (`ca_policy` in a server `tls-conf
 Build and install the branch (`make install`), then, anywhere with `radiusd`, `eapol_test`,
 OpenSSL >= 3.0 and python3:
 
-    ./run.sh <workdir> [scenario ...|fast|vg]
+    ./run.sh <workdir> [scenario ...|fast|vg|ocsp]
 
 Each scenario starts `radiusd -fxx` on its own port on 127.0.0.1 and runs `eapol_test`
 against it. `vg` runs 4, 5, 8 and 9 with radiusd under valgrind memcheck and fails on any
@@ -17,6 +17,14 @@ SLOW scenarios 15 and 16 wait for the 300 s `ca_path_reload_interval` and run in
 background next to the rest (about 5.5 min in all). To show that the tests guard the code,
 run the harness of this branch against a build without the feature: the scenarios which
 need it fail.
+
+The per-CA OCSP scenarios (30-49, `ocsp`, in `ocsp.sh`) also need `radclient`, python3 with
+`cryptography`, and root: they add `ocsp.capol.test` to `/etc/hosts` and point
+`/etc/resolv.conf` at a stub DNS server, so run them in a throwaway container without a
+network (`docker run --network none ...`). `vg` adds 31, 33, 35, 36, 38 and 39 under
+valgrind. With `ASAN=1` the harness expects an AddressSanitizer build of radiusd and fails a
+scenario on any ASan report whose stack is in our code (`tls_ca_policy*.c`,
+`cbtls_verify`).
 
 ## Verdict rules
 
@@ -34,6 +42,17 @@ need it fail.
   otherwise it is INCONCLUSIVE (exit 2), not a pass.
 - RECORD rows are measurements (16: is a new CRL file picked up before the rebuild; 20: OCSP
   with an unconfigured CA), they never fail.
+
+OCSP verdicts (scenarios 30-49):
+
+- **Reject `<verdict>`** counts only if `eapol_test` fails and the server log of that probe
+  has `ocsp verdict <verdict>` (`revoked`, `unknown`, or `failed <class>` with one of
+  `transport busy response verify config`).
+- **Accept, good** counts only if the log has `ocsp verdict good` and the responder logged at
+  least one request during the probe; **Accept, not needed** only if there is no verdict line
+  and the responder logged none.
+- Times (scenario 38) are those of the whole `eapol_test` run; a baseline with a good answer
+  is recorded next to them.
 
 ## The marker is a contract
 
@@ -97,3 +116,35 @@ and 22 check how that walk ends and that every candidate issuer counts.
 | 22 | Qold, Qnew: same DN, other keys; Sq under Qnew without AKID; policy {Qnew} | Reject 3 with either bundle order; control {U}: Accept |
 | 23 | the client certificate itself trusted (a chain of one) | {S}: Accept + "trusted directly" WARN with its key; {U}, U trusted: Reject 3/33 |
 | 24 | 15 u-ok + 5 s-rev at once | all verdicts right, exactly one WARN for U |
+
+### Per-CA OCSP (`ocsp.sh`)
+
+The responder (`ocsp_responder.py`) answers on 127.0.0.1:17881 (the AIA of the test leaves,
+`http://ocsp.capol.test:17881/aia`), 17882 and 17883 (`ocsp_url` A and B); a scenario changes
+what it answers by rewriting its `state.json` (status, signer, times, responseStatus, HTTP
+status, delay, a body which is not DER, ...), and every request is logged. `net_stub.py`
+provides a closed port (17891), a black hole (17892: `listen(0)`, accept queue filled, so a
+new connect hangs), a peer which never answers (17893), and DNS servers which answer NXDOMAIN
+or nothing.
+
+| # | Setup | Expected |
+|---|---|---|
+| 30 | `-XC` on valid lines (orders, tabs, IPv6, no path, `HTTP://`) and on errors (`ocsp_url` without `ocsp`, https, ldap, no scheme, bad or 0 port, no host, empty, bare `ocsp_url`, flags twice, `ocsp=1`, `OCSP`, no flags, with `ocsp { enable = yes }`, duplicate key) | exit 0 + marker, WARN only with `crl` / exit != 0 naming the line |
+| 31 | {S ocsp}, URL from the AIA: good / revoked / unknown | Accept / Reject revoked (reason, time) / Reject unknown; 1 request each |
+| 32 | U not listed; R listed (CertID of S); responder serving only S / only R; R2->P->I with P listed, responder serving I / P | 0 requests Accept; good; good / failed response (unauthorized); good / failed response |
+| 33 | URL: override with an AIA (used), caIssuers only + URL, no AIA + URL; no URL and no AIA, caIssuers only, https only; ldap then http; Microsoft layout (OCSP third) | good x3; failed config, 0 requests x3, "responder none"; the http entry; good |
+| 34 | responder without nonce | Accept; the request has no nonce, SHA-1 CertID |
+| 35 | tryLater, unauthorized, internalError, malformedRequest, sigRequired; HTTP 500; not DER | failed response x5; failed transport x2 |
+| 36 | signer: CA with / without its certificate, delegate with / without nocheck; delegate without EKU, bad signature, delegate of another CA, the leaf (with / without its certificate); status for another serial only | good x4; failed verify x6 |
+| 37 | nextUpdate -10 / -2 min, thisUpdate +10 / +2 min, no nextUpdate and 1 h / 2 min old | failed verify / good, alternating |
+| 38 | refused, black hole, silent, 1 byte per 0.5 s, NXDOMAIN | failed transport within 5.5 / 4.5 / 4.5 / 4.5 / 5.5 s; times recorded |
+| 49 | DNS that never answers, `timeout:1 attempts:1` and defaults | failed transport; times recorded |
+| 39 | black hole, 8 at once, 32 threads; PEAP meanwhile | 4 transport + 4 busy; each PEAP < 1 s |
+| 46 | healthy responder, 32 at once, latency 0 / 20 / 50 ms (recorded) and 100 ms | 32 Accept, 0 busy at 100 ms |
+| 47 | black hole, 50 at once, 32 threads; MAB and PEAP meanwhile; then 4 at once for another CA | 50 Reject (transport or busy), at most 8 transport; each MAB / PEAP < 1 s; 4 Accept |
+| 48 | 100 rejects of each kind (two transport, response, verify, revoked, unknown, config), 4 at a time; then 4 good at once | all counted, 0 busy; 4 Accept |
+| 40 | CRL and OCSP on S: CRL-revoked (no request), OCSP-revoked, both good; response signed by S without R's CRL; U OCSP only next to S crl (CA and delegate signers) | Reject 23 + 0 requests; Reject revoked; good x4 |
+| 41 | R and S with URLs: S's is used; S without URL, R with one: the leaf's AIA is used | good, on the expected URL |
+| 42 | PEAP and TTLS on the tls-config | Accept, 0 requests |
+| 43 | revoked / unknown / failed | the server sends certificate_revoked / certificate_unknown / certificate_unknown |
+| 44 | session cache on, `eapol_test -r 1` | recorded: the resumed handshake makes no request |

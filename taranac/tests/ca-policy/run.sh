@@ -2,12 +2,17 @@
 # ca_policy harness: runs radiusd (EAP-TLS, check_crl) against eapol_test on 127.0.0.1.
 #
 #   run.sh <workdir> [scenario ...]        default: all; "fast" = all but the SLOW 15 and 16;
-#                                          "vg" = 4 5 8 9 with radiusd under valgrind (memcheck)
+#                                          "vg" = 4 5 8 9 and the OCSP 31 33 35 36 38 39 with
+#                                          radiusd under valgrind (memcheck); "ocsp" = 30-49;
+#                                          ASAN=1: radiusd is an AddressSanitizer build, reports
+#                                          are checked for our code after every scenario
 #
 # Needs in PATH (or RADIUSD=/path): radiusd built from the ref under test, eapol_test,
-# openssl >= 3.0, python3.  Every scenario starts its own radiusd on its own port, so a
-# daemon is always fresh.  SLOW scenarios 15/16 wait for
-# ca_path_reload_interval (300 s) and run in the background next to the others.
+# radclient, openssl >= 3.0, python3; for the OCSP scenarios 30-49 also python3 cryptography
+# and root (they write /etc/hosts and /etc/resolv.conf of the throwaway container).  Every
+# scenario starts its own radiusd on its own port, so a daemon is always fresh.  SLOW
+# scenarios 15/16 wait for ca_path_reload_interval (300 s) and run in the background next to
+# the others.  The OCSP scenarios are in ocsp.sh.
 #
 # Output: <workdir>/results.tsv (scenario, case, expected, actual, verdict), times.tsv,
 #         <workdir>/summary.md, <workdir>/spki-fixtures/, a directory per scenario with
@@ -32,12 +37,15 @@ W=$(cd "$W" && pwd)
 RADIUSD=${RADIUSD:-radiusd}
 DICTDIR=${DICTDIR:-/usr/share/freeradius}
 LIBDIR=${LIBDIR:-/usr/lib/freeradius}
-ALL="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24 15 16"
+OCSP_ALL="30 31 32 33 34 35 36 37 38 49 39 46 47 48 40 41 42 43 44"
+ALL="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24 $OCSP_ALL 15 16"
 VALGRIND=${VALGRIND:-0}
+ASAN=${ASAN:-0}
 case "${*:-all}" in
 all)  SCEN=$ALL ;;
-fast) SCEN="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24" ;;
-vg)   SCEN="4 5 8 9"; VALGRIND=1 ;;
+fast) SCEN="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24 $OCSP_ALL" ;;
+vg)   SCEN="4 5 8 9 31 33 35 36 38 39"; VALGRIND=1 ;;
+ocsp) SCEN=$OCSP_ALL ;;
 *)    SCEN=$* ;;
 esac
 # eapol_test timeouts: a daemon under valgrind is many times slower
@@ -96,7 +104,8 @@ row() { # row <case> <expected> <actual> <PASS|FAIL|RECORD|INCONCLUSIVE>
 # ---- configuration ----------------------------------------------------------------------------
 # Per scenario: CA="R S U", CRLS="S", POLICY="<hash> ..." (each becomes '<hash> crl'),
 # RAW_POLICY=(lines verbatim), CHECK_CRL=yes|no, RELOAD=""|300, EXTRA_TLS, PEAP=0|1
-reset_conf() { CA=""; CRLS=""; POLICY=""; RAW_POLICY=(); CHECK_CRL=yes; RELOAD=""; EXTRA_TLS=""; PEAP=0; }
+# THREADS = max_servers, CACHE = the body of the tls-config cache section
+reset_conf() { CA=""; CRLS=""; POLICY=""; RAW_POLICY=(); CHECK_CRL=yes; RELOAD=""; EXTRA_TLS=""; PEAP=0; THREADS=4; CACHE="enable = no"; }
 
 gen_conf() { # gen_conf <dir> <port>
 	local d=$1 port=$2 c h l
@@ -142,10 +151,10 @@ security {
 	allow_vulnerable_openssl = yes
 }
 thread pool {
-	start_servers = 2
-	max_servers = 4
+	start_servers = $(( THREADS <= 4 ? 2 : THREADS ))
+	max_servers = $THREADS
 	min_spare_servers = 1
-	max_spare_servers = 4
+	max_spare_servers = $THREADS
 }
 client local {
 	ipaddr = 127.0.0.1
@@ -168,9 +177,18 @@ C
 		virtual_server = \"inner-tunnel\"
 	}
 	mschapv2 {
+	}
+	ttls {
+		tls = tls-nac
+		default_eap_type = mschapv2
+		virtual_server = \"inner-tunnel\"
 	}"
 		cat >"$d/raddb/mods-enabled/mschap" <<'C'
 mschap {
+}
+C
+		cat >"$d/raddb/mods-enabled/pap" <<'C'
+pap {
 }
 C
 		cat >"$d/raddb/sites-enabled/inner-tunnel" <<'C'
@@ -182,6 +200,7 @@ server inner-tunnel {
 		eap {
 			ok = return
 		}
+		pap
 	}
 	authenticate {
 		Auth-Type eap {
@@ -189,6 +208,9 @@ server inner-tunnel {
 		}
 		Auth-Type MS-CHAP {
 			mschap
+		}
+		Auth-Type PAP {
+			pap
 		}
 	}
 }
@@ -211,7 +233,7 @@ $pol		cipher_list = "DEFAULT"
 		tls_min_version = "1.2"
 		tls_max_version = "1.2"
 		cache {
-			enable = no
+			$CACHE
 		}
 $EXTRA_TLS
 	}
@@ -229,6 +251,13 @@ server default {
 		port = $port
 	}
 	authorize {
+		# not EAP: a MAB-like probe, accepted at once (scenarios 39, 47)
+		if (!&EAP-Message) {
+			update control {
+				&Auth-Type := Accept
+			}
+			return
+		}
 		eap {
 			ok = return
 		}
@@ -261,6 +290,9 @@ srv_start() { # srv_start <name>: D, PORT, SLOG; 0 = up
 		valgrind --tool=memcheck --leak-check=full --show-leak-kinds=definite --errors-for-leak-kinds=definite \
 			--num-callers=30 --log-file="$D/valgrind.log" \
 			"$(command -v "$RADIUSD")" -fxx -l stdout -d "$D/raddb" >"$SLOG" 2>&1 &
+	elif [ "$ASAN" = 1 ]; then
+		ASAN_OPTIONS="log_path=$D/asan:detect_leaks=1:abort_on_error=0:halt_on_error=0" \
+			"$RADIUSD" -fxx -l stdout -d "$D/raddb" >"$SLOG" 2>&1 &
 	else
 		"$RADIUSD" -fxx -l stdout -d "$D/raddb" >"$SLOG" 2>&1 &
 	fi
@@ -278,6 +310,20 @@ srv_start() { # srv_start <name>: D, PORT, SLOG; 0 = up
 srv_stop() {
 	kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null
 	[ "$VALGRIND" = 1 ] && vg_check
+	[ "$ASAN" = 1 ] && asan_check
+	return 0
+}
+
+# AddressSanitizer: reports (errors and leaks) whose stack has our code in it
+asan_check() {
+	local f n=0 ours=0
+	for f in "$D"/asan.*; do
+		[ -f "$f" ] || continue
+		n=$((n + $(grep -c '^==[0-9]*==ERROR\|^Direct leak\|^Indirect leak' "$f")))
+		ours=$((ours + $(gawk 'BEGIN { RS = "\n\n" } /tls_ca_policy|ca_policy_|cbtls_verify/ && /ERROR|leak/ { n++ } END { print n + 0 }' "$f")))
+	done
+	if [ "$ours" = 0 ]; then row asan "no ASan report in ca_policy / cbtls_verify" "reports in our code: 0 (all reports: $n)" PASS
+	else row asan "no ASan report in ca_policy / cbtls_verify" "reports in our code: $ours (all reports: $n)" FAIL; fi
 }
 
 # valgrind: count the error and definite-leak records whose stack has our code in it
@@ -296,7 +342,19 @@ eapol_conf() {
 	shift 2
 	cat "$P/leaf/$leaf.pem" >"$D/$label.chain.pem"
 	for c in "$@"; do cat "$(cert "$c")" >>"$D/$label.chain.pem"; done
-	if [ "$leaf" = peap ]; then
+	if [ "$leaf" = ttls ]; then
+		cat >"$D/$label.eapol.conf" <<C
+network={
+	key_mgmt=IEEE8021X
+	eap=TTLS
+	identity="ttls-user"
+	password="capol-pass"
+	phase2="auth=PAP"
+	ca_cert="$P/SRV/cert.pem"
+	eapol_flags=0
+}
+C
+	elif [ "$leaf" = peap ]; then
 		cat >"$D/$label.eapol.conf" <<C
 network={
 	key_mgmt=IEEE8021X
@@ -763,6 +821,8 @@ sc24() { # 20 clients at once: right verdicts, exactly one WARN
 	srv_stop
 }
 
+. "$HERE/ocsp.sh"
+
 # ---- driver -----------------------------------------------------------------------------------
 say "radiusd: $("$RADIUSD" -v 2>/dev/null | head -1)"
 say "openssl: $(openssl version)"
@@ -787,11 +847,12 @@ for s in $SCEN; do
 	esac
 done
 [ -n "$BG" ] && { say "waiting for the SLOW scenarios"; wait $BG; }
+ocsp_stop
 
 # ---- summary ----------------------------------------------------------------------------------
 printf 'scenario\tcase\texpected\tactual\tverdict\n' >"$W/results.tsv"
 for s in $ALL; do
-	for f in "$W/res-$s.tsv" "$W/res-${s}a.tsv" "$W/res-${s}b.tsv" "$W/res-${s}c.tsv"; do
+	for f in "$W/res-$s.tsv" "$W/res-$s"[a-z].tsv; do
 		[ -f "$f" ] && cat "$f" >>"$W/results.tsv"
 	done
 done

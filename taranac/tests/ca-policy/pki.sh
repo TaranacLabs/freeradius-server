@@ -13,6 +13,8 @@
 #   A <-> B: A' = A cross-signed by B, B' = B cross-signed by A (a loop) -> x-ok issued by A
 #   Qold, Qnew: two roots with the same DN and different keys -> Sq (issued by Qnew, NO AKID) -> q-ok
 #   SRV -> server                                      the server's own chain, never trusted for clients
+#   OCSP: S -> s-aia, s-ms, s-cai, s-https, s-ldap, s-good2 (AIA variants), ocsp-s-{nocheck,nonocheck,noeku}
+#         (delegated responders of S), I -> i-aia; ocsp-u (delegated responder of U)
 #
 # CRL files go to crl/<name>.pem; the harness copies the ones a scenario needs into its ca_path.
 set -eu
@@ -84,6 +86,44 @@ authorityKeyIdentifier = keyid
 basicConstraints = CA:false
 keyUsage = critical,digitalSignature
 extendedKeyUsage = OCSPSigning
+[ v3_ocsp_nocheck ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = OCSPSigning
+noCheck = ignored
+[ v3_ocsp_noeku ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature
+[ v3_client_aia ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+authorityKeyIdentifier = keyid
+authorityInfoAccess = OCSP;URI:http://ocsp.capol.test:17881/aia
+[ v3_client_aia_ms ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+authorityKeyIdentifier = keyid
+authorityInfoAccess = caIssuers;URI:ldap:///CN=CAPOL-AIA?cACertificate?base,caIssuers;URI:http://pki.capol.test/S.crt,OCSP;URI:http://ocsp.capol.test:17881/aia
+[ v3_client_aia_cai ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+authorityKeyIdentifier = keyid
+authorityInfoAccess = caIssuers;URI:http://pki.capol.test/S.crt
+[ v3_client_aia_https ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+authorityKeyIdentifier = keyid
+authorityInfoAccess = OCSP;URI:https://ocsp.capol.test:17881/aia
+[ v3_client_aia_ldap ]
+basicConstraints = CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = clientAuth
+authorityKeyIdentifier = keyid
+authorityInfoAccess = OCSP;URI:ldap://ocsp.capol.test/CN=S,OCSP;URI:http://ocsp.capol.test:17881/aia
 [ base_ext ]
 freshestCRL = URI:http://example.invalid/delta.crl
 [ delta_ext ]
@@ -230,6 +270,23 @@ newkey leaf/ocsp-u.key ec
 run openssl req -new -key leaf/ocsp-u.key -out leaf/ocsp-u.csr -subj "/CN=CAPOL OCSP U" -config U/ca.cnf
 run openssl ca -batch -config U/ca.cnf -extensions v3_ocsp -in leaf/ocsp-u.csr -out leaf/ocsp-u.pem -notext
 
+# ---- per-CA OCSP (scenarios 31-49) ---------------------------------------------------------------
+# Leaves under S with the AIA variants (responder ocsp.capol.test:17881, a name the harness puts in
+# /etc/hosts), delegated responders of S, and a leaf under I with an AIA.
+leaf S s-aia v3_client_aia
+leaf S s-ms v3_client_aia_ms
+leaf S s-cai v3_client_aia_cai
+leaf S s-https v3_client_aia_https
+leaf S s-ldap v3_client_aia_ldap
+leaf S s-good2 v3_client_aia
+leaf I i-aia v3_client_aia
+for d in nocheck:v3_ocsp_nocheck nonocheck:v3_ocsp noeku:v3_ocsp_noeku; do
+	n=ocsp-s-${d%%:*}
+	newkey "leaf/$n.key" ec
+	run openssl req -new -key "leaf/$n.key" -out "leaf/$n.csr" -subj "/CN=CAPOL OCSP S ${d%%:*}" -config S/ca.cnf
+	run openssl ca -batch -config S/ca.cnf -extensions "${d#*:}" -in "leaf/$n.csr" -out "leaf/$n.pem" -notext
+done
+
 # ---- self-checks: the PKI is what the scenarios assume ------------------------------------------
 fail() { echo "pki SELF-CHECK FAIL: $*" >&2; exit 1; }
 h() { python3 -I "$HERE/spki.py" hash "$1"; }
@@ -260,6 +317,14 @@ openssl verify -no-CApath -CAfile Qold/cert.pem -untrusted Sq/cert.pem leaf/q-ok
 [ "$(h Qold/cert.pem)" != "$(h Qnew/cert.pem)" ] || fail "Qold and Qnew share a key"
 [ "$(openssl x509 -in Ax/cert.pem -noout -issuer)" = "issuer=CN=CAPOL Loop B" ] || fail "A' not issued by B"
 [ "$(openssl x509 -in Bx/cert.pem -noout -issuer)" = "issuer=CN=CAPOL Loop A" ] || fail "B' not issued by A"
+openssl x509 -in leaf/s-aia.pem -noout -ocsp_uri | grep -qx 'http://ocsp.capol.test:17881/aia' || fail "s-aia has no OCSP AIA"
+[ "$(openssl x509 -in leaf/s-ms.pem -noout -ocsp_uri)" = "http://ocsp.capol.test:17881/aia" ] || fail "s-ms OCSP AIA"
+openssl x509 -in leaf/s-ms.pem -noout -text | grep -A1 'Authority Information Access' | grep -q 'CA Issuers - URI:ldap' || fail "s-ms: caIssuers ldap is not first"
+[ -z "$(openssl x509 -in leaf/s-cai.pem -noout -ocsp_uri)" ] || fail "s-cai has an OCSP AIA"
+[ "$(openssl x509 -in leaf/s-ldap.pem -noout -ocsp_uri | head -1)" = "ldap://ocsp.capol.test/CN=S" ] || fail "s-ldap: ldap is not first"
+openssl x509 -in leaf/ocsp-s-nocheck.pem -noout -text | grep -q 'OCSP No Check' || fail "ocsp-s-nocheck has no nocheck"
+openssl x509 -in leaf/ocsp-s-nonocheck.pem -noout -text | grep -q 'OCSP No Check' && fail "ocsp-s-nonocheck has nocheck"
+openssl x509 -in leaf/ocsp-s-noeku.pem -noout -text | grep -q 'OCSP Signing' && fail "ocsp-s-noeku has the OCSPSigning EKU"
 rm -f u.pem rs.pem .last.log
 chmod -R a+rX "$P"
 echo "pki: OK ($(ls leaf/*.pem | wc -l) leaf certs, $(ls crl | wc -l) CRLs)"
