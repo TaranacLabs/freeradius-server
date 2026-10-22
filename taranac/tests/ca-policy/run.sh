@@ -97,7 +97,10 @@ for c in R Rre S Sx U R2 P I E PSS N Nn SRV A B Qold Qnew Sq Lu; do H[$c]=$(ref_
 
 # ---- result rows ------------------------------------------------------------------------------
 row() { # row <case> <expected> <actual> <PASS|FAIL|RECORD|INCONCLUSIVE>
-	printf '%s\t%s\t%s\t%s\t%s\n' "$SC" "$1" "$2" "$3" "$4" >>"$W/res-$SC.tsv"
+	# tabs and newlines inside a field (e.g. configuration lines in a start error) would shift
+	# the columns of results.tsv, and the verdict with them
+	local e=${2//[$'\t\n']/ } a=${3//[$'\t\n']/ }
+	printf '%s\t%s\t%s\t%s\t%s\n' "$SC" "${1//[$'\t\n']/ }" "$e" "$a" "$4" >>"$W/res-$SC.tsv"
 	say "  [$4] $SC/$1: expected: $2 | got: $3"
 }
 

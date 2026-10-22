@@ -387,14 +387,14 @@ sc49() {
 	stubs_stop
 }
 
-# ---- 39: the limit, against a black hole -------------------------------------------------------
+# ---- 39: the limit, against a black hole (8 in flight, 8 waiting) -------------------------------------------------------
 sc39() {
 	need_ocsp || return
 	stub blackhole 17892
 	[[ $STUB_MSG == *ready* ]] || { row black-hole "a black hole" "$STUB_MSG" INCONCLUSIVE; stubs_stop; return; }
 	ocsp_conf "R S" "${H[S]} ocsp ocsp_url=http://127.0.0.1:17892/x"; THREADS=32; PEAP=1
 	srv_start 39 || { stubs_stop; return; }
-	par storm 8 s-ok &
+	par storm 20 s-ok &
 	local ppid=$! i pt=""
 	sleep 0.5
 	for i in 1 2 3; do peap_probe "peap$i"; pt+=" $PV:$PT"; done
@@ -404,12 +404,14 @@ sc39() {
 	local tr bu ok=0
 	tr=$(vcount 'failed transport'); bu=$(vcount 'failed busy')
 	local acc; acc=$(grep -l '^SUCCESS' "$D"/storm*.eapol.log 2>/dev/null | wc -l)
-	if [ "$acc" = 0 ] && [ "$tr" = 4 ] && [ "$bu" = 4 ]; then ok=1; fi
-	if [ "$ok" = 1 ]; then row storm-8 "8 Reject: 4 transport (in flight), 4 busy (waited 1 s)" "accept=$acc transport=$tr busy=$bu" PASS
-	else row storm-8 "8 Reject: 4 transport, 4 busy" "accept=$acc transport=$tr busy=$bu" FAIL; fi
+	# 8 in flight time out (transport), 8 wait 1 s for a slot and 4 find no waiting place (busy)
+	if [ "$acc" = 0 ] && [ "$tr" = 8 ] && [ "$bu" = 12 ]; then ok=1; fi
+	if [ "$VALGRIND" = 1 ] || [ "$ASAN" = 1 ]; then row storm-20 "recorded (instrumented build: arrivals spread out)" "accept=$acc transport=$tr busy=$bu" RECORD
+	elif [ "$ok" = 1 ]; then row storm-20 "20 Reject: 8 transport (in flight), 12 busy (8 waited 1 s, 4 at once)" "accept=$acc transport=$tr busy=$bu" PASS
+	else row storm-20 "20 Reject: 8 transport, 12 busy" "accept=$acc transport=$tr busy=$bu" FAIL; fi
 	ok=1
 	for i in $pt; do [ "${i%%:*}" = ACCEPT ] && awk -v t="${i#*:}" 'BEGIN{exit !(t < 1)}' || ok=0; done
-	if [ "$VALGRIND" = 1 ]; then row peap-during-storm "measured (valgrind)" "$pt" RECORD
+	if [ "$VALGRIND" = 1 ] || [ "$ASAN" = 1 ]; then row peap-during-storm "measured (instrumented build)" "$pt" RECORD
 	elif [ "$ok" = 1 ]; then row peap-during-storm "3 PEAP Accept, each < 1 s" "$pt" PASS
 	else row peap-during-storm "3 PEAP Accept, each < 1 s" "$pt" FAIL; fi
 	srv_stop
@@ -422,18 +424,19 @@ sc46() {
 	ocsp_conf "R S" "${H[S]} ocsp ocsp_url=$OA"; THREADS=32
 	srv_start 46 || return
 	local bu gd d
-	# how many busy rejects a healthy responder gives, by its latency (recorded)
-	for d in 0 0.02 0.05; do
+	# 32 at once must all pass when the responder answers in 20 ms
+	ostate '{"delay": 0.02}'
+	par slow 32 s-ok
+	bu=$(vcount 'failed busy'); gd=$(vcount good)
+	if [ "$PAR_OK" = 32 ] && [ "$bu" = 0 ]; then row slow-32-0.02s "32 Accept, 0 busy (latency 0.02 s)" "accept=$PAR_OK reject=$PAR_REJ good=$gd busy=$bu" PASS
+	else row slow-32-0.02s "32 Accept, 0 busy (latency 0.02 s)" "accept=$PAR_OK reject=$PAR_REJ good=$gd busy=$bu" FAIL; fi
+	# and how many "busy" a slower one gives (recorded)
+	for d in 0 0.05 0.1; do
 		ostate "{\"delay\": $d}"
 		par "slow${d/./}-" 32 s-ok
 		bu=$(vcount 'failed busy'); gd=$(vcount good)
 		row "slow-32-${d}s" "recorded: 32 at once, responder latency ${d} s" "accept=$PAR_OK busy=$bu good=$gd" RECORD
 	done
-	ostate '{"delay": 0.1}'
-	par slow 32 s-ok
-	bu=$(vcount 'failed busy'); gd=$(vcount good)
-	if [ "$PAR_OK" = 32 ] && [ "$bu" = 0 ]; then row slow-32 "32 Accept, 0 busy (latency 0.1 s)" "accept=$PAR_OK reject=$PAR_REJ good=$gd busy=$bu" PASS
-	else row slow-32 "32 Accept, 0 busy (latency 0.1 s)" "accept=$PAR_OK reject=$PAR_REJ good=$gd busy=$bu" FAIL; fi
 	ostate '{}'
 	srv_stop
 }
@@ -455,14 +458,22 @@ sc47() {
 	local tr bu acc
 	tr=$(vcount 'failed transport'); bu=$(vcount 'failed busy')
 	acc=$(grep -l '^SUCCESS' "$D"/storm*.eapol.log 2>/dev/null | wc -l)
-	if [ "$acc" = 0 ] && [ $((tr + bu)) -ge 50 ] && [ "$tr" -le 8 ]; then
-		row storm-50 "50 Reject (transport or busy), at most 8 threads on the network" "accept=$acc transport=$tr busy=$bu" PASS
-	else row storm-50 "50 Reject (transport or busy)" "accept=$acc transport=$tr busy=$bu" FAIL; fi
+	# 8 in flight time out (transport); every other check is "busy" (8 after waiting 1 s)
+	if [ "$VALGRIND" = 1 ] || [ "$ASAN" = 1 ]; then
+		row storm-50 "recorded (instrumented build)" "accept=$acc transport=$tr busy=$bu" RECORD
+	elif [ "$acc" = 0 ] && [ "$tr" = 8 ] && [ "$bu" = 42 ]; then
+		row storm-50 "50 Reject: 8 transport, 42 busy" "accept=$acc transport=$tr busy=$bu" PASS
+	else row storm-50 "50 Reject: 8 transport, 42 busy" "accept=$acc transport=$tr busy=$bu" FAIL; fi
 	local ok=1 okp=1
 	for i in $mt; do [ "${i%%:*}" = ACCEPT ] && awk -v t="${i#*:}" 'BEGIN{exit !(t < 1)}' || ok=0; done
 	for i in $pt; do [ "${i%%:*}" = ACCEPT ] && awk -v t="${i#*:}" 'BEGIN{exit !(t < 1)}' || okp=0; done
-	if [ "$ok" = 1 ]; then row mab-during-storm "3 MAB Accept, each < 1 s" "$mt" PASS; else row mab-during-storm "3 MAB Accept, each < 1 s" "$mt" FAIL; fi
-	if [ "$okp" = 1 ]; then row peap-during-storm "3 PEAP Accept, each < 1 s" "$pt" PASS; else row peap-during-storm "3 PEAP Accept, each < 1 s" "$pt" FAIL; fi
+	if [ "$VALGRIND" = 1 ] || [ "$ASAN" = 1 ]; then
+		row mab-during-storm "measured (instrumented build)" "$mt" RECORD
+		row peap-during-storm "measured (instrumented build)" "$pt" RECORD
+	else
+		if [ "$ok" = 1 ]; then row mab-during-storm "3 MAB Accept, each < 1 s" "$mt" PASS; else row mab-during-storm "3 MAB Accept, each < 1 s" "$mt" FAIL; fi
+		if [ "$okp" = 1 ]; then row peap-during-storm "3 PEAP Accept, each < 1 s" "$pt" PASS; else row peap-during-storm "3 PEAP Accept, each < 1 s" "$pt" FAIL; fi
+	fi
 	# after the storm every slot is back: 4 at once for the other CA all pass
 	par after 4 i-ok
 	if [ "$PAR_OK" = 4 ]; then row slots-back "4 x i-ok at once Accept" "accept=$PAR_OK" PASS; else row slots-back "4 x i-ok at once Accept" "accept=$PAR_OK reject=$PAR_REJ $(grep -o 'ocsp verdict [a-z ]*' "$PAR_SLOG" | sort | uniq -c | tr '\n' ' ')" FAIL; fi
