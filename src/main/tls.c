@@ -3513,7 +3513,7 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 					my_ok = 0;
 					break;
 				}
-			} else
+			} else	/* the upstream branches below: keep this "else" next to their "if" when rebasing */
 #endif
 			/*
 			 *	No OCSP, allow external verification.
