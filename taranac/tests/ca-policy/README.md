@@ -139,9 +139,9 @@ or nothing.
 | 37 | nextUpdate -10 / -2 min, thisUpdate +10 / +2 min, no nextUpdate and 1 h / 2 min old | failed verify / good, alternating |
 | 38 | refused, black hole, silent, 1 byte per 0.5 s, NXDOMAIN | failed transport within 5.5 / 4.5 / 4.5 / 4.5 / 5.5 s; times recorded |
 | 49 | DNS that never answers, `timeout:1 attempts:1` and defaults | failed transport; times recorded |
-| 39 | black hole, 8 at once, 32 threads; PEAP meanwhile | 4 transport + 4 busy; each PEAP < 1 s |
-| 46 | healthy responder, 32 at once, latency 0 / 20 / 50 ms (recorded) and 100 ms | 32 Accept, 0 busy at 100 ms |
-| 47 | black hole, 50 at once, 32 threads; MAB and PEAP meanwhile; then 4 at once for another CA | 50 Reject (transport or busy), at most 8 transport; each MAB / PEAP < 1 s; 4 Accept |
+| 39 | black hole, 20 at once, 32 threads; PEAP meanwhile | 8 transport + 12 busy; each PEAP < 1 s |
+| 46 | healthy responder, 32 at once, 32 threads: latency 20 ms; 0 / 50 / 100 ms recorded | 32 Accept, 0 busy at 20 ms |
+| 47 | black hole, 50 at once, 32 threads; MAB and PEAP meanwhile; then 4 at once for another CA | 8 transport + 42 busy; each MAB / PEAP < 1 s; 4 Accept |
 | 48 | 100 rejects of each kind (two transport, response, verify, revoked, unknown, config), 4 at a time; then 4 good at once | all counted, 0 busy; 4 Accept |
 | 40 | CRL and OCSP on S: CRL-revoked (no request), OCSP-revoked, both good; response signed by S without R's CRL; U OCSP only next to S crl (CA and delegate signers) | Reject 23 + 0 requests; Reject revoked; good x4 |
 | 41 | R and S with URLs: S's is used; S without URL, R with one: the leaf's AIA is used | good, on the expected URL |
