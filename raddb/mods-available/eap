@@ -441,9 +441,10 @@ eap {
 		#  (TLS-OCSP-Cert-Valid = 2), and nothing is logged.
 		#
 		#    - Only the client certificate is checked, once,
-		#      after its whole chain has verified (CRLs
-		#      included).  Intermediate CAs are not: take a
-		#      revoked CA out of the trusted CAs.
+		#      after OpenSSL has checked the signatures, times
+		#      and CRLs of its chain (name constraints come
+		#      after).  Intermediate CAs are not: take a revoked
+		#      CA out of the trusted CAs.
 		#    - The request is about the client certificate and
 		#      its issuer (SHA-1 CertID), without a nonce:
 		#      Microsoft's Online Responder answers
@@ -462,8 +463,10 @@ eap {
 		#      (https and ldap entries are skipped).  Neither:
 		#      the client is rejected.  Only http: OCSP
 		#      responses are signed.  "ocsp_url" needs "ocsp";
-		#      an https, empty or unparsable URL, or a flag given
-		#      twice, is a configuration error.
+		#      an https, empty or unparsable URL, port 0, a byte
+		#      outside printable ASCII, or a flag given twice, is
+		#      a configuration error.  AIA entries like that are
+		#      skipped.
 		#    - The response must be signed by the issuer of the
 		#      client certificate, or by a responder it
 		#      delegated to (extended key usage OCSPSigning).
@@ -472,22 +475,31 @@ eap {
 		#      the trusted CAs (ca_file, ca_path) WITHOUT CRL
 		#      checks: a delegated responder certificate is not
 		#      checked for revocation (Microsoft's carry
-		#      id-pkix-ocsp-nocheck).  These trusted CAs are read
-		#      at startup only; ca_path_reload_interval does not
-		#      re-read them.
+		#      id-pkix-ocsp-nocheck).  This store is created at
+		#      startup; ca_path_reload_interval does not re-create
+		#      it.
 		#    - No soft fail.  Anything other than "good" rejects
 		#      the client: revoked, unknown, no URL, no answer,
 		#      an HTTP error, a non-successful responseStatus
 		#      (tryLater, unauthorized, ...), a bad signature,
 		#      a stale response.
-		#    - One deadline of 3 seconds for the whole check
-		#      (connect, send, receive).  Name resolution is not
-		#      bounded by it: the responder's name must resolve
-		#      quickly, or use an IP address.  At most 4 OCSP
-		#      requests are in progress at a time per
-		#      tls-config; one more waits up to 1 second (out of
-		#      the 3) for a free slot, then is rejected.  So a
-		#      dead responder cannot take every worker thread.
+		#    - One deadline for the whole check (connect, send,
+		#      receive): about 3 seconds.  OpenSSL counts whole
+		#      seconds and, after a refused connection or a name
+		#      which does not resolve, retries until the deadline
+		#      has passed: up to about 4 seconds, plus the time of
+		#      the last name lookup (about 5 seconds in all).
+		#      Name resolution is not bounded by OpenSSL: the
+		#      responder's name must resolve quickly, or use an IP
+		#      address.
+		#    - At most 4 OCSP requests are in progress at a time
+		#      per tls-config, and at most 4 more checks wait for
+		#      a slot, each up to 1 second (out of the deadline).
+		#      Any more are rejected at once ("busy").  So a dead
+		#      responder holds at most 8 worker threads.  The
+		#      slots are per tls-config, not per responder: while
+		#      the responder of one CA is dead, checks for another
+		#      CA can be rejected as "busy".
 		#    - No cache: one request per full handshake.  A
 		#      resumed session is not checked again; disable the
 		#      session cache to check every authentication.
@@ -495,7 +507,8 @@ eap {
 		#    - "ocsp" lines and "ocsp { enable = yes }" below
 		#      cannot be used together (configuration error).
 		#      The "ocsp" section is unchanged, for everyone
-		#      else.  "ocsp" needs OpenSSL 3.0 or later.
+		#      else.  "ocsp" needs OpenSSL 3.0 or later; it is
+		#      tested with OpenSSL 3.3.
 		#
 		#  A reject sets the certificate error (23, certificate
 		#  revoked; 75, unknown to the responder; 74, OCSP check
@@ -505,17 +518,30 @@ eap {
 		#	(TLS) ocsp verdict unknown: the responder does not know the certificate; responder <url>
 		#	(TLS) ocsp verdict failed <class>: <detail>; responder <url or none>
 		#
-		#  <class> is "transport" (no HTTP 200 answer in time:
-		#  name, connection, timeout, HTTP error, too many
-		#  requests in progress), "response" (an answer which is
-		#  not a successful OCSP response) or "verify" (the
-		#  response or the certificate could not be checked: no
-		#  responder URL, no issuer, signature or signer, no
-		#  status for the certificate, times).  <time> is
-		#  ISO 8601 UTC.  "ocsp verdict", the three verdicts and
-		#  the three classes are a contract, as the line below
-		#  is: Taranac reads them.  Do not change them without
-		#  Taranac.
+		#  <class> is one of:
+		#
+		#	transport	no usable answer in time: name,
+		#			connection, timeout, HTTP status
+		#			other than 200, not a DER OCSP
+		#			response
+		#	busy		the 4 slots and 4 waiting places
+		#			of this tls-config are taken, or no
+		#			slot came free within 1 second; says
+		#			nothing about this responder
+		#	response	responseStatus other than successful
+		#			(tryLater, unauthorized, ...), or not
+		#			a basic response
+		#	verify		the response does not hold:
+		#			signature or signer, no status for
+		#			the certificate, times
+		#	config		the check could not be made here: no
+		#			responder URL, no issuer, the chain
+		#			could not be looked at, out of memory
+		#
+		#  <time> is ISO 8601 UTC.  "ocsp verdict", the three
+		#  verdicts and the five classes are a contract, as the
+		#  line below is: Taranac reads them.  Do not change them
+		#  without Taranac.
 		#
 		#  Every server TLS configuration (an EAP tls-config, and
 		#  also the "tls" subsection of a listen or client section)
