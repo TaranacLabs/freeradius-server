@@ -29,8 +29,10 @@
  * or status listener whose address, port and socket type match one
  * of them uses it instead of opening its own, and one which matches
  * none is a startup error: the supervisor decides what the server
- * listens on.  Once the server is about to process requests, it
- * writes "READY\n" to the ready descriptor and closes it.
+ * listens on.  So is a listed descriptor which no listener takes:
+ * the supervisor would be holding a socket nobody reads.  Once the
+ * server is about to process requests, it writes "READY\n" to the
+ * ready descriptor and closes it.
  *
  * Both variables are removed from the environment, and every
  * descriptor is marked close-on-exec, so that no child process holds
@@ -291,30 +293,37 @@ int fr_inherit_take(fr_ipaddr_t const *ipaddr, uint16_t port, int type)
 
 /** Tell the supervisor that the server is about to process requests
  *
- * Inherited sockets which no listener took are closed: nothing in
- * this process will ever read them.
+ * An inherited socket which no listener took is an error: the
+ * supervisor keeps it in its group, and datagrams sent to it would
+ * never be read.
+ *
+ * @return
+ *	- 0 on success.
+ *	- -1 if an inherited socket is not used by any listener.
  */
-void fr_inherit_ready(void)
+int fr_inherit_ready(void)
 {
 	static char const	msg[] = "READY\n";
 	char			buffer[128];
-	int			i;
+	int			i, unused = 0;
 
 	for (i = 0; i < num_inherited; i++) {
 		if (inherited[i].taken) continue;
 
-		WARN("Inherited socket %s port %u (fd %d) is not used by any listener, closing it",
-		     inet_ntop(inherited[i].ipaddr.af, &inherited[i].ipaddr.ipaddr, buffer, sizeof(buffer)),
-		     inherited[i].port, inherited[i].fd);
-		close(inherited[i].fd);
-		inherited[i].taken = true;
+		ERROR("Inherited socket %s port %u (fd %d) is not used by any listener",
+		      inet_ntop(inherited[i].ipaddr.af, &inherited[i].ipaddr.ipaddr, buffer, sizeof(buffer)),
+		      inherited[i].port, inherited[i].fd);
+		unused++;
 	}
+	if (unused) return -1;
 
-	if (ready_fd < 0) return;
+	if (ready_fd < 0) return 0;
 
 	if (write(ready_fd, msg, sizeof(msg) - 1) < 0) {
 		WARN("Failed telling the supervising process that we are ready: %s", fr_syserror(errno));
 	}
 	close(ready_fd);
 	ready_fd = -1;
+
+	return 0;
 }

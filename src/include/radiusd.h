@@ -588,7 +588,7 @@ int	fr_bool_auto_parse(CONF_PAIR *cp, fr_bool_auto_t *out, char const *str);
 int fr_inherit_init(void);
 bool fr_inherit_active(void);
 int fr_inherit_take(fr_ipaddr_t const *ipaddr, uint16_t port, int type);
-void fr_inherit_ready(void);
+int fr_inherit_ready(void);
 
 /* listen.c */
 void listen_free(rad_listen_t **head);

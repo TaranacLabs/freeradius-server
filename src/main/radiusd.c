@@ -666,7 +666,7 @@ int main(int argc, char *argv[])
 	 *  Tell a supervising process that we are about to process
 	 *  requests.
 	 */
-	fr_inherit_ready();
+	if (fr_inherit_ready() < 0) exit(EXIT_FAILURE);
 
 #ifdef HAVE_SYSTEMD
 	{
