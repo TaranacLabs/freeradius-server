@@ -492,11 +492,13 @@ eap {
 		#      Name resolution is not bounded by OpenSSL: the
 		#      responder's name must resolve quickly, or use an IP
 		#      address.
-		#    - At most 4 OCSP requests are in progress at a time
-		#      per tls-config, and at most 4 more checks wait for
+		#    - At most 8 OCSP requests are in progress at a time
+		#      per tls-config, and at most 8 more checks wait for
 		#      a slot, each up to 1 second (out of the deadline).
 		#      Any more are rejected at once ("busy").  So a dead
-		#      responder holds at most 8 worker threads.  The
+		#      responder holds at most 16 worker threads: give the
+		#      server enough threads ("max_servers") for that and
+		#      for everything else it does.  The
 		#      slots are per tls-config, not per responder: while
 		#      the responder of one CA is dead, checks for another
 		#      CA can be rejected as "busy".
@@ -524,7 +526,7 @@ eap {
 		#			connection, timeout, HTTP status
 		#			other than 200, not a DER OCSP
 		#			response
-		#	busy		the 4 slots and 4 waiting places
+		#	busy		the 8 slots and 8 waiting places
 		#			of this tls-config are taken, or no
 		#			slot came free within 1 second; says
 		#			nothing about this responder
