@@ -2,7 +2,7 @@
 """SPKI helpers for the ca_policy harness (stdlib only).
 
   spki.py hash <pem>              sha256 of the raw SubjectPublicKeyInfo bytes, sliced out of the
-                                  TBSCertificate: the algorithm Taranac's spki_sha256() uses
+                                  TBSCertificate: what a tool which writes ca_policy lines should hash
   spki.py spki-hex <pem>          the raw SPKI bytes, hex
   spki.py ecpoint <pem>           first byte of the EC point in the SPKI BIT STRING (02/03 = compressed)
   spki.py strip-null <in> <out>   copy of an RSA certificate whose SPKI AlgorithmIdentifier has no NULL

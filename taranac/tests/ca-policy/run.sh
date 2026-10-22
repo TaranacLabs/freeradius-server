@@ -6,7 +6,7 @@
 #
 # Needs in PATH (or RADIUSD=/path): radiusd built from the ref under test, eapol_test,
 # openssl >= 3.0, python3.  Every scenario starts its own radiusd on its own port, so a
-# daemon is always fresh (verdict rule A9).  SLOW scenarios 15/16 wait for
+# daemon is always fresh.  SLOW scenarios 15/16 wait for
 # ca_path_reload_interval (300 s) and run in the background next to the others.
 #
 # Output: <workdir>/results.tsv (scenario, case, expected, actual, verdict), times.tsv,
@@ -14,7 +14,7 @@
 #         raddb, radiusd.log and per-probe logs.
 # Exit:   0 all PASS (RECORD rows are measurements), 1 any FAIL, 2 any INCONCLUSIVE.
 #
-# Verdicts (design v2.1 §6.1, A9):
+# Verdicts:
 #   Reject N  - eapol_test fails AND the probe's slice of the server log has
 #               "OpenSSL says error N".
 #   Accept, chain without a configured CA - eapol_test succeeds AND since this daemon
@@ -378,7 +378,7 @@ xc() { # xc <name>: run radiusd -XC on a generated config, XC_RC, XC_LOG
 }
 
 # ---- scenarios --------------------------------------------------------------------------------
-sc0() { # F1: -XC with valid lines exits 0 and prints the marker (an old binary: exit 0, no marker)
+sc0() { # -XC with valid lines exits 0 and prints the marker (an old binary: exit 0, no marker)
 	reset_conf; CA="R S U"; CRLS="S"; POLICY="${H[S]} ${H[U]}"
 	xc 0
 	local m; m=$(marker_in "$XC_LOG")
@@ -609,7 +609,7 @@ sc16() { # SLOW, measurement: a CRL file appearing in ca_path without a store re
 	srv_stop
 }
 
-sc17() { # SPKI hash: C (daemon WARN) = asn1parse reference = product algorithm (raw TBS slice)
+sc17() { # SPKI hash: C (daemon WARN) = asn1parse reference = spki.py (raw TBS slice)
 	reset_conf; CA="R U E PSS Nn"; POLICY="${H[SRV]}"
 	srv_start 17 || return
 	expect_marker 1
@@ -624,9 +624,9 @@ sc17() { # SPKI hash: C (daemon WARN) = asn1parse reference = product algorithm 
 		cp "$(cert "$ca")" "$fx/$ca.pem"
 		printf '%s\t%s\t%s\t%s\t%s\n' "$ca" "$ca.pem" "${c:-none}" "${H[$ca]}" "$py" >>"$fx/spki-hashes.tsv"
 		if [ "$V" = ACCEPT ] && [ -n "$c" ] && [ "$c" = "${H[$ca]}" ] && [ "$c" = "$py" ]; then
-			row "spki-$ca" "C = asn1parse = py" "C=${c:0:16}… ref=${H[$ca]:0:16}… py=${py:0:16}…" PASS
+			row "spki-$ca" "C = asn1parse = py" "C=${c:0:16}... ref=${H[$ca]:0:16}... py=${py:0:16}..." PASS
 		else
-			row "spki-$ca" "C = asn1parse = py" "$V C=${c:-none} ref=${H[$ca]:0:16}… py=${py:0:16}…" FAIL
+			row "spki-$ca" "C = asn1parse = py" "$V C=${c:-none} ref=${H[$ca]:0:16}... py=${py:0:16}..." FAIL
 		fi
 	done
 	srv_stop
@@ -660,7 +660,7 @@ sc19() { # certificate attributes exist in post-auth on an Accept whose CRL erro
 	srv_stop
 }
 
-sc20() { # characterisation of m4: OCSP on, U (not configured) with an OCSP responder
+sc20() { # recorded: the upstream "ocsp" section on, U (not listed) with an OCSP responder
 	reset_conf; CA="R S U"; CRLS="S"; POLICY="${H[S]}"
 	local oport=$(( $(port_of 20) + 5 ))
 	EXTRA_TLS="		ocsp {
@@ -679,7 +679,7 @@ sc20() { # characterisation of m4: OCSP on, U (not configured) with an OCSP resp
 	srv_start 20 || { kill $opid 2>/dev/null; return; }
 	expect_marker 1
 	probe u-ok u-ok
-	row u-ok-ocsp "recorded as is (the OCSP task changes it)" \
+	row u-ok-ocsp "recorded as is" \
 		"$(got); $(grep -iE 'ocsp' "$PLOG" | grep -viE 'Creating attributes|^\s*$' | sed 's/^([0-9]*) //' | sort -u | head -4 | tr '\n' ' ')" RECORD
 	srv_stop
 	kill $opid 2>/dev/null; wait $opid 2>/dev/null
