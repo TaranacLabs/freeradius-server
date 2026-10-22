@@ -5,7 +5,7 @@ SOURCES := acct.c auth.c client.c crypt.c files.c \
 		  session.c threads.c channel.c \
 		  process.c realms.c detail.c
 ifneq ($(OPENSSL_LIBS),)
-SOURCES	+= cb.c tls.c tls_ca_policy.c tls_listen.c
+SOURCES	+= cb.c tls.c tls_ca_policy.c tls_ca_policy_ocsp.c tls_listen.c
 endif
 
 SRC_CFLAGS	:= -DHOSTINFO=\"${HOSTINFO}\"
