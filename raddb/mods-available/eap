@@ -376,10 +376,12 @@ eap {
 		#  rejects clients of a CA which publishes none
 		#  (error 3, "unable to get certificate CRL").
 		#
-		#  "ca_policy" names the CAs which do have a CRL.  It
-		#  can be given any number of times:
+		#  "ca_policy" names the CAs which do have a CRL, and
+		#  the CAs whose client certificates are checked with
+		#  OCSP (see "Per-CA OCSP" below).  It can be given any
+		#  number of times, one line per CA:
 		#
-		#	ca_policy = "<sha256 of the CA's SPKI> crl"
+		#	ca_policy = "<sha256 of the CA's SPKI> [crl] [ocsp] [ocsp_url=<http URL>]"
 		#
 		#  The first token is the SHA-256, in 64 hex digits,
 		#  of the raw SubjectPublicKeyInfo of the CA
@@ -391,8 +393,8 @@ eap {
 		#  "openssl asn1parse -in ca.pem -offset <O> -length <hl+l>
 		#  -noout -out spki.der; sha256sum spki.der".  Re-issued
 		#  or cross-signed copies of a CA share its key, and so
-		#  its line.  The other tokens are flags.  The only
-		#  flag is "crl".
+		#  its line.  The other tokens are flags, in any order,
+		#  at least one: "crl", "ocsp", "ocsp_url=<http URL>".
 		#
 		#  The rule is an OR over the chain up to its root: if
 		#  ANY certificate in it is listed, CRL errors stand, as
@@ -428,8 +430,92 @@ eap {
 		#  Lines are parsed at startup.  A malformed line, an
 		#  unknown flag, a line without flags or a duplicate
 		#  key hash is a configuration error.  Without
-		#  "check_crl = yes" the lines have no effect (with a
-		#  warning).
+		#  "check_crl = yes" the "crl" flags have no effect
+		#  (with a warning, if there is one).
+		#
+		#  Per-CA OCSP.  A client certificate is checked with
+		#  OCSP if ANY certificate in its chain, up to the root,
+		#  is listed with "ocsp": the same OR, and the same walk
+		#  through the trusted CAs, as for "crl".  A CA without
+		#  "ocsp" needs nothing: its clients are not checked
+		#  (TLS-OCSP-Cert-Valid = 2), and nothing is logged.
+		#
+		#    - Only the client certificate is checked, once,
+		#      after its whole chain has verified (CRLs
+		#      included).  Intermediate CAs are not: take a
+		#      revoked CA out of the trusted CAs.
+		#    - The request is about the client certificate and
+		#      its issuer (SHA-1 CertID), without a nonce:
+		#      Microsoft's Online Responder answers
+		#      "unauthorized" to a nonce.  A response is
+		#      accepted within its thisUpdate / nextUpdate, with
+		#      5 minutes of clock skew, and one without
+		#      nextUpdate only if thisUpdate is at most 5
+		#      minutes old.  Without a nonce, a "good" response
+		#      can be replayed by someone on the path until its
+		#      nextUpdate.
+		#    - The responder: "ocsp_url=" of the NEAREST listed
+		#      CA (the issuer first, then up), if it has one,
+		#      always, whatever the certificate says.  Otherwise
+		#      the first http OCSP entry in the Authority
+		#      Information Access of the client certificate
+		#      (https and ldap entries are skipped).  Neither:
+		#      the client is rejected.  Only http: OCSP
+		#      responses are signed.  "ocsp_url" needs "ocsp";
+		#      an https, empty or unparsable URL, or a flag given
+		#      twice, is a configuration error.
+		#    - The response must be signed by the issuer of the
+		#      client certificate, or by a responder it
+		#      delegated to (extended key usage OCSPSigning).
+		#      The signer is looked for in the client's verified
+		#      chain and in the response, and verified against
+		#      the trusted CAs (ca_file, ca_path) WITHOUT CRL
+		#      checks: a delegated responder certificate is not
+		#      checked for revocation (Microsoft's carry
+		#      id-pkix-ocsp-nocheck).  These trusted CAs are read
+		#      at startup only; ca_path_reload_interval does not
+		#      re-read them.
+		#    - No soft fail.  Anything other than "good" rejects
+		#      the client: revoked, unknown, no URL, no answer,
+		#      an HTTP error, a non-successful responseStatus
+		#      (tryLater, unauthorized, ...), a bad signature,
+		#      a stale response.
+		#    - One deadline of 3 seconds for the whole check
+		#      (connect, send, receive).  Name resolution is not
+		#      bounded by it: the responder's name must resolve
+		#      quickly, or use an IP address.  At most 4 OCSP
+		#      requests are in progress at a time per
+		#      tls-config; one more waits up to 1 second (out of
+		#      the 3) for a free slot, then is rejected.  So a
+		#      dead responder cannot take every worker thread.
+		#    - No cache: one request per full handshake.  A
+		#      resumed session is not checked again; disable the
+		#      session cache to check every authentication.
+		#    - CRL and OCSP on the same CA: both apply.
+		#    - "ocsp" lines and "ocsp { enable = yes }" below
+		#      cannot be used together (configuration error).
+		#      The "ocsp" section is unchanged, for everyone
+		#      else.  "ocsp" needs OpenSSL 3.0 or later.
+		#
+		#  A reject sets the certificate error (23, certificate
+		#  revoked; 75, unknown to the responder; 74, OCSP check
+		#  failed) and adds ONE line to Module-Failure-Message:
+		#
+		#	(TLS) ocsp verdict revoked: reason <reason>, revoked at <time>; responder <url>
+		#	(TLS) ocsp verdict unknown: the responder does not know the certificate; responder <url>
+		#	(TLS) ocsp verdict failed <class>: <detail>; responder <url or none>
+		#
+		#  <class> is "transport" (no HTTP 200 answer in time:
+		#  name, connection, timeout, HTTP error, too many
+		#  requests in progress), "response" (an answer which is
+		#  not a successful OCSP response) or "verify" (the
+		#  response or the certificate could not be checked: no
+		#  responder URL, no issuer, signature or signer, no
+		#  status for the certificate, times).  <time> is
+		#  ISO 8601 UTC.  "ocsp verdict", the three verdicts and
+		#  the three classes are a contract, as the line below
+		#  is: Taranac reads them.  Do not change them without
+		#  Taranac.
 		#
 		#  Every server TLS configuration (an EAP tls-config, and
 		#  also the "tls" subsection of a listen or client section)
@@ -444,6 +530,8 @@ eap {
 		#  its wording without Taranac.
 		#
 	#	ca_policy = "<64 hex digits> crl"
+	#	ca_policy = "<64 hex digits> crl ocsp"
+	#	ca_policy = "<64 hex digits> ocsp ocsp_url=http://pki.example.com/ocsp"
 
 		#  If check_cert_issuer is set, the value will
 		#  be checked against the DN of the issuer in
@@ -796,6 +884,10 @@ eap {
 		#  Responder. This makes it possible to immediately
 		#  revoke certificates without the distribution of
 		#  new Certificate Revocation Lists (CRLs).
+		#
+		#  This section checks EVERY client certificate.  For
+		#  OCSP on some CAs only, see "Per-CA OCSP" under
+		#  "ca_policy" above: the two cannot be used together.
 		#
 		ocsp {
 			#  Enable it.  The default is "no".
