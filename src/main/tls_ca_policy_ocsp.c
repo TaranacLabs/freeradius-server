@@ -25,8 +25,8 @@
  * same OR as for "crl").  The responder is the "ocsp_url" of the nearest
  * such CA if it has one, else the first http OCSP entry in the AIA of the
  * client certificate.  Only the client certificate is checked, once, after
- * its chain has verified.  If the check cannot be made, the client is
- * rejected: there is no soft fail.
+ * OpenSSL has checked the signatures, times and CRLs of its chain.  If the
+ * check cannot be made, the client is rejected: there is no soft fail.
  *
  * This is not the "ocsp { }" section, which applies to every client
  * certificate, and the two cannot be used together.  The differences:
@@ -36,12 +36,17 @@
  *    and a response without nextUpdate must be at most
  *    OCSP_MAX_AGE seconds old.
  *  - one deadline, FR_TLS_CA_POLICY_OCSP_TIMEOUT, for the whole exchange:
- *    waiting for a slot, connecting, sending and reading.  Name resolution
- *    is the exception: getaddrinfo() is not bounded by OpenSSL.
+ *    waiting for a slot, connecting, sending and reading.  OpenSSL counts
+ *    in whole seconds of time(), and polls past the deadline by up to a
+ *    second after a refused connection or a failed name lookup.  Name
+ *    resolution itself is not bounded by OpenSSL.
  *  - at most FR_TLS_CA_POLICY_OCSP_INFLIGHT requests at a time per
- *    tls-config, so that a slow or dead responder cannot take every worker
- *    thread.  A request waits at most FR_TLS_CA_POLICY_OCSP_SLOT_WAIT for
- *    a slot, out of the same deadline.
+ *    tls-config, and at most FR_TLS_CA_POLICY_OCSP_WAITERS more waiting for
+ *    a slot, each for at most FR_TLS_CA_POLICY_OCSP_SLOT_WAIT out of the
+ *    same deadline.  Beyond that a check fails at once ("busy").  So a slow
+ *    or dead responder holds at most INFLIGHT + WAITERS worker threads.  The
+ *    slots are per tls-config, not per responder: a dead responder of one
+ *    CA can make checks for another CA fail as "busy".
  *  - the signer of the response is verified against a store without CRL
  *    flags, with the client's verified chain as the untrusted
  *    certificates.  So a response signed by the CA itself verifies without
@@ -50,6 +55,9 @@
  *    Module-Failure-Message.  See tls_ca_policy_ocsp().
  *
  * There is no cache of responses: one request per full handshake.
+ *
+ * Written against, and tested with, OpenSSL 3.3: the OSSL_HTTP_* timeout
+ * semantics relied on here were read in that version.
  */
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
@@ -75,14 +83,24 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #define OCSP_MAX_SKEW	(5 * 60)
 #define OCSP_MAX_AGE	(5 * 60)
 
-/** Requests in flight, per tls-config
+/*
+ *	The slot wait runs on the monotonic clock where the condition
+ *	variable can be told to, so that a step of the wall clock does not
+ *	stretch it.  OpenSSL's own deadlines are on time() regardless.
+ */
+#if defined(CLOCK_MONOTONIC) && !defined(__APPLE__)
+#  define OCSP_SLOT_CLOCK CLOCK_MONOTONIC
+#endif
+
+/** Requests in flight and waiting, per tls-config
  *
- * Both fields are used with conf->mutex held.  A talloc child of the
+ * The counters are used with conf->mutex held.  A talloc child of the
  * configuration, so that it goes with it.
  */
 struct fr_tls_ca_policy_ocsp_slots_t {
 	pthread_cond_t	cond;		//!< Signalled when a slot is given back.
 	uint32_t	inflight;
+	uint32_t	waiting;
 };
 
 /** What one check came to, and the words for it
@@ -96,10 +114,43 @@ typedef struct {
 	char			detail[512];
 } ocsp_outcome_t;
 
+typedef enum {
+	OCSP_SLOT_TAKEN = 0,			//!< Give it back with ocsp_slot_give().
+	OCSP_SLOT_FULL,				//!< INFLIGHT in flight and WAITERS waiting.
+	OCSP_SLOT_TIMEOUT,			//!< Waited SLOT_WAIT, no slot came free.
+	OCSP_SLOT_ERROR				//!< The wait itself failed.
+} ocsp_slot_t;
+
 static int _ocsp_slots_free(fr_tls_ca_policy_ocsp_slots_t *slots)
 {
 	pthread_cond_destroy(&slots->cond);
 	return 0;
+}
+
+/** The last OpenSSL error raised since the innermost mark, 0 if none
+ *
+ * Where ERR_count_to_mark() exists (3.2), it says whether there is one.
+ * Before that, a new error is told from an old one by its code only.
+ */
+static unsigned long ocsp_new_error(unsigned long before, char const **data, int *flags)
+{
+	char const	*file = NULL, *func = NULL;
+	int		line = 0;
+	unsigned long	code;
+
+	*data = NULL;
+	*flags = 0;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L
+	(void) before;
+	if (ERR_count_to_mark() == 0) return 0;
+	code = ERR_peek_last_error_all(&file, &line, &func, data, flags);
+#else
+	code = ERR_peek_last_error_all(&file, &line, &func, data, flags);
+	if (code == before) return 0;
+#endif
+
+	return code;
 }
 
 /** Create the OCSP signer store and the slots of a tls-config
@@ -111,10 +162,10 @@ static int _ocsp_slots_free(fr_tls_ca_policy_ocsp_slots_t *slots)
  * by a sub-CA, and fail for CAs without one.  OpenSSL 3 skips the CRL check
  * of a delegated signer with id-pkix-ocsp-nocheck anyway.
  *
- * The store is read once, here.  ca_path_reload_interval does not re-read
- * it.  It goes in conf->ocsp_store, which is free as "ocsp { enable }" and
- * "ca_policy ... ocsp" cannot be used together, and is freed with the
- * configuration.
+ * The store is created once, here: ca_path_reload_interval does not
+ * re-create it (ca_path is still looked up by hash when needed).  It goes in
+ * conf->ocsp_store, which is free as "ocsp { enable }" and "ca_policy ...
+ * ocsp" cannot be used together, and is freed with the configuration.
  *
  * Called after the mutex is initialised.
  *
@@ -124,14 +175,25 @@ int tls_ca_policy_ocsp_init(fr_tls_server_conf_t *conf)
 {
 	fr_tls_ca_policy_ocsp_slots_t	*slots;
 	X509_STORE			*store;
+	pthread_condattr_t		attr;
+	int				rcode;
 
 	slots = talloc_zero(conf, fr_tls_ca_policy_ocsp_slots_t);
 	if (!slots) {
 		ERROR(LOG_PREFIX ": Out of memory");
 		return -1;
 	}
-	if (pthread_cond_init(&slots->cond, NULL) != 0) {
-		ERROR(LOG_PREFIX ": Failed initialising the OCSP slots of ca_policy");
+
+	rcode = pthread_condattr_init(&attr);
+	if (rcode == 0) {
+#ifdef OCSP_SLOT_CLOCK
+		rcode = pthread_condattr_setclock(&attr, OCSP_SLOT_CLOCK);
+#endif
+		if (rcode == 0) rcode = pthread_cond_init(&slots->cond, &attr);
+		pthread_condattr_destroy(&attr);
+	}
+	if (rcode != 0) {
+		ERROR(LOG_PREFIX ": Failed initialising the OCSP slots of ca_policy: %s", fr_syserror(rcode));
 		talloc_free(slots);
 		return -1;
 	}
@@ -158,11 +220,45 @@ int tls_ca_policy_ocsp_init(fr_tls_server_conf_t *conf)
 	return 0;
 }
 
+/** Is an explicit port of 0 given in a URL
+ *
+ * OSSL_HTTP_parse_url() turns ":0" into the default port, so look for it.
+ */
+static bool ocsp_url_port_zero(char const *url)
+{
+	char const	*a, *end, *p;
+	bool		digits = false;
+
+	a = strstr(url, "://");
+	a = a ? a + 3 : url;
+	end = a + strcspn(a, "/?#");
+
+	p = memchr(a, '@', end - a);
+	if (p) a = p + 1;
+
+	if (*a == '[') {
+		p = memchr(a, ']', end - a);
+		if (!p) return false;
+		p++;
+	} else {
+		p = a + strcspn(a, ":/?#");
+	}
+	if ((p >= end) || (*p != ':')) return false;
+
+	for (p++; p < end; p++) {
+		if (*p != '0') return false;
+		digits = true;
+	}
+
+	return digits;
+}
+
 /** Split an OCSP responder URL into host, port and path
  *
  * Only http: responses are signed, TLS adds nothing to them.  The scheme is
  * case-insensitive.  The port defaults to 80 and the path to "/"; a query
- * stays in the path.
+ * stays in the path.  Only printable ASCII without spaces (0x21 - 0x7e) is
+ * accepted: the URL goes into the HTTP request line and into the verdict.
  *
  * @param[in] ctx	talloc parent of the strings.
  * @param[in] url	to parse.
@@ -175,8 +271,18 @@ int tls_ca_policy_ocsp_url_parse(TALLOC_CTX *ctx, char const *url, char const **
 				 char const **path)
 {
 	static char const https[] = "https responder URLs are not supported: OCSP responses are signed, use http";
-	char	*copy, *h = NULL, *p = NULL, *u = NULL;
-	int	ssl = 0, i, rcode = -1;
+	char		*copy, *h = NULL, *p = NULL, *u = NULL;
+	char const	*c, *data;
+	int		ssl = 0, i, rcode = -1, flags;
+	unsigned long	before, code;
+
+	for (c = url; *c; c++) {
+		if ((*c < 0x21) || (*c > 0x7e)) {
+			fr_strerror_printf("the responder URL has a byte outside printable ASCII (0x%02x)",
+					   (unsigned int) (uint8_t) *c);
+			return -1;
+		}
+	}
 
 	if (strncasecmp(url, "https://", 8) == 0) {
 		fr_strerror_printf("%s", https);
@@ -185,6 +291,11 @@ int tls_ca_policy_ocsp_url_parse(TALLOC_CTX *ctx, char const *url, char const **
 
 	if (strncasecmp(url, "http://", 7) != 0) {
 		fr_strerror_printf("the responder URL must start with http://");
+		return -1;
+	}
+
+	if (ocsp_url_port_zero(url)) {
+		fr_strerror_printf("the responder URL has port 0");
 		return -1;
 	}
 
@@ -198,10 +309,13 @@ int tls_ca_policy_ocsp_url_parse(TALLOC_CTX *ctx, char const *url, char const **
 	}
 	for (i = 0; i < 4; i++) copy[i] = tolower((uint8_t) copy[i]);
 
+	before = ERR_peek_last_error();
 	ERR_set_mark();
-	if (!OCSP_parse_url(copy, &h, &p, &u, &ssl)) {
-		char const *reason = ERR_reason_error_string(ERR_peek_last_error());
+	if (!OSSL_HTTP_parse_url(copy, &ssl, NULL, &h, &p, NULL, &u, NULL, NULL)) {
+		char const *reason = NULL;
 
+		code = ocsp_new_error(before, &data, &flags);
+		if (code) reason = ERR_reason_error_string(code);
 		fr_strerror_printf("cannot parse the responder URL%s%s", reason ? ": " : "", reason ? reason : "");
 		goto done;
 	}
@@ -233,34 +347,71 @@ done:
 	return rcode;
 }
 
-/** Take a slot for a request, waiting at most FR_TLS_CA_POLICY_OCSP_SLOT_WAIT
+/** Take a slot for a request
  *
- * The wait is against the wall clock, as are OpenSSL's own deadlines.
+ * With INFLIGHT requests in flight, wait for one to finish, at most
+ * SLOT_WAIT, unless WAITERS are waiting already: then fail at once.
  *
- * @return true if a slot was taken, and must be given back.
+ * conf->mutex is taken without a timeout.  It is only ever held for
+ * moments (the slots, the table of logged issuers, and the re-creation of
+ * the X509 store by ca_path_reload_interval), and never across the network.
+ *
+ * @param[in] conf	of the tls-config.
+ * @param[out] err	the error of the wait, for OCSP_SLOT_ERROR.
+ * @return one of ocsp_slot_t.
  */
-static bool ocsp_slot_take(fr_tls_server_conf_t *conf)
+static ocsp_slot_t ocsp_slot_take(fr_tls_server_conf_t *conf, int *err)
 {
 	fr_tls_ca_policy_ocsp_slots_t	*slots = conf->ca_policy_ocsp_slots;
-	struct timeval			now;
 	struct timespec			until;
-	bool				taken = false;
+	ocsp_slot_t			rcode = OCSP_SLOT_TAKEN;
+	int				ret = 0;
 
-	gettimeofday(&now, NULL);
-	until.tv_sec = now.tv_sec + FR_TLS_CA_POLICY_OCSP_SLOT_WAIT;
-	until.tv_nsec = now.tv_usec * 1000;
+	*err = 0;
+
+#ifdef OCSP_SLOT_CLOCK
+	clock_gettime(OCSP_SLOT_CLOCK, &until);
+#else
+	{
+		struct timeval now;
+
+		gettimeofday(&now, NULL);
+		until.tv_sec = now.tv_sec;
+		until.tv_nsec = now.tv_usec * 1000;
+	}
+#endif
+	until.tv_sec += FR_TLS_CA_POLICY_OCSP_SLOT_WAIT;
 
 	pthread_mutex_lock(&conf->mutex);
-	while (slots->inflight >= FR_TLS_CA_POLICY_OCSP_INFLIGHT) {
-		if (pthread_cond_timedwait(&slots->cond, &conf->mutex, &until) != 0) break;	/* ETIMEDOUT */
+	if (slots->inflight >= FR_TLS_CA_POLICY_OCSP_INFLIGHT) {
+		if (slots->waiting >= FR_TLS_CA_POLICY_OCSP_WAITERS) {
+			rcode = OCSP_SLOT_FULL;
+			goto done;
+		}
+
+		slots->waiting++;
+		while (slots->inflight >= FR_TLS_CA_POLICY_OCSP_INFLIGHT) {
+			ret = pthread_cond_timedwait(&slots->cond, &conf->mutex, &until);
+			if (ret != 0) break;
+		}
+		slots->waiting--;
+
+		if (slots->inflight >= FR_TLS_CA_POLICY_OCSP_INFLIGHT) {
+			if (ret == ETIMEDOUT) {
+				rcode = OCSP_SLOT_TIMEOUT;
+			} else {
+				*err = ret;
+				rcode = OCSP_SLOT_ERROR;
+			}
+			goto done;
+		}
 	}
-	if (slots->inflight < FR_TLS_CA_POLICY_OCSP_INFLIGHT) {
-		slots->inflight++;
-		taken = true;
-	}
+	slots->inflight++;
+
+done:
 	pthread_mutex_unlock(&conf->mutex);
 
-	return taken;
+	return rcode;
 }
 
 static void ocsp_slot_give(fr_tls_server_conf_t *conf)
@@ -275,10 +426,12 @@ static void ocsp_slot_give(fr_tls_server_conf_t *conf)
 
 /** Record a reject
  *
- * For a failure ("failed <class>"), the OpenSSL error behind it, if there
- * is a new one, is added: the last one on the queue, with its data (where
- * OCSP_basic_verify() puts the reason, and the HTTP client the server).
- * The detail of "revoked" and "unknown" is ours alone.
+ * For a failure the responder or OpenSSL is behind ("failed transport",
+ * "failed response", "failed verify"), the OpenSSL error raised in the
+ * check, if there is one, is added: the last one on the queue, with its
+ * data (where OCSP_basic_verify() puts the reason, and the HTTP client the
+ * server).  The detail of "revoked", "unknown", "busy" and "config" is ours
+ * alone.
  */
 static void ocsp_reject(ocsp_outcome_t *out, char const *verdict, int x509_err, bool openssl, char const *fmt, ...)
 	CC_HINT(format (printf, 5, 6));
@@ -287,8 +440,8 @@ static void ocsp_reject(ocsp_outcome_t *out, char const *verdict, int x509_err, 
 	va_list		ap;
 	size_t		len;
 	unsigned long	code;
-	char const	*file = NULL, *func = NULL, *data = NULL;
-	int		line = 0, flags = 0;
+	char const	*data;
+	int		flags;
 	char		buf[256];
 
 	out->result = FR_TLS_CA_POLICY_OCSP_FAILED;
@@ -301,8 +454,8 @@ static void ocsp_reject(ocsp_outcome_t *out, char const *verdict, int x509_err, 
 
 	if (!openssl) return;
 
-	code = ERR_peek_last_error_all(&file, &line, &func, &data, &flags);
-	if (!code || (code == out->err_before)) return;
+	code = ocsp_new_error(out->err_before, &data, &flags);
+	if (!code) return;
 
 	ERR_error_string_n(code, buf, sizeof(buf));
 	len = strlen(out->detail);
@@ -311,9 +464,14 @@ static void ocsp_reject(ocsp_outcome_t *out, char const *verdict, int x509_err, 
 		 ((flags & ERR_TXT_STRING) && data && *data) ? data : "");
 }
 
+/*
+ *	The classes of "failed" (a contract, see tls_ca_policy_ocsp()).
+ */
 #define REJECT_TRANSPORT(_fmt, ...)	ocsp_reject(&out, "failed transport", OCSP_X509_ERR_FAILED, true, _fmt, ## __VA_ARGS__)
+#define REJECT_BUSY(_fmt, ...)		ocsp_reject(&out, "failed busy", OCSP_X509_ERR_FAILED, false, _fmt, ## __VA_ARGS__)
 #define REJECT_RESPONSE(_fmt, ...)	ocsp_reject(&out, "failed response", OCSP_X509_ERR_FAILED, true, _fmt, ## __VA_ARGS__)
 #define REJECT_VERIFY(_fmt, ...)	ocsp_reject(&out, "failed verify", OCSP_X509_ERR_FAILED, true, _fmt, ## __VA_ARGS__)
+#define REJECT_CONFIG(_fmt, ...)	ocsp_reject(&out, "failed config", OCSP_X509_ERR_FAILED, false, _fmt, ## __VA_ARGS__)
 
 #ifdef X509_V_ERR_OCSP_VERIFY_FAILED
 #  define OCSP_X509_ERR_FAILED	X509_V_ERR_OCSP_VERIFY_FAILED
@@ -341,9 +499,10 @@ static char const *ocsp_time(char *buf, size_t len, ASN1_GENERALIZEDTIME const *
 
 /** Pick the responder from the AIA of a certificate: the first http OCSP entry
  *
- * https and ldap entries, and entries which do not parse, are skipped.
+ * https and ldap entries, and entries which do not parse or have bytes
+ * outside printable ASCII, are skipped.
  *
- * @return 0 found, -1 none.
+ * @return 0 found, -1 none, -2 out of memory.
  */
 static int ocsp_aia_url(REQUEST *request, TALLOC_CTX *ctx, X509 *leaf, char const **url,
 			char const **host, char const **port, char const **path)
@@ -360,12 +519,12 @@ static int ocsp_aia_url(REQUEST *request, TALLOC_CTX *ctx, X509 *leaf, char cons
 		if (!uri) continue;
 
 		if (tls_ca_policy_ocsp_url_parse(ctx, uri, host, port, path) < 0) {
-			RDEBUG2("(TLS) ocsp: skipping AIA OCSP entry \"%s\": %s", uri, fr_strerror());
+			RDEBUG2("(TLS) ocsp: skipping an AIA OCSP entry: %s", fr_strerror());
 			continue;
 		}
 
 		*url = talloc_strdup(ctx, uri);
-		if (*url) rcode = 0;
+		rcode = *url ? 0 : -2;
 		break;
 	}
 	X509_email_free(uris);
@@ -375,22 +534,34 @@ static int ocsp_aia_url(REQUEST *request, TALLOC_CTX *ctx, X509 *leaf, char cons
 
 /** Check a client certificate with OCSP, if a CA in its chain says so
  *
- * Called for depth 0 with ok = 1: the whole chain has verified, CRLs
- * included.  On a reject, the X509_STORE_CTX error is set so that the
- * client gets an alert which says why (certificate_revoked for a revoked
+ * Called for depth 0 with ok = 1: OpenSSL has checked the signatures, the
+ * times and the CRLs of the chain (name constraints and RFC 3779 come
+ * after).  On a reject, the X509_STORE_CTX error is set so that the client
+ * gets an alert which says why (certificate_revoked for a revoked
  * certificate), and one line goes to Module-Failure-Message:
  *
  *	(TLS) ocsp verdict revoked: reason <reason>, revoked at <time>; responder <url>
  *	(TLS) ocsp verdict unknown: the responder does not know the certificate; responder <url>
  *	(TLS) ocsp verdict failed <class>: <detail>; responder <url or none>
  *
- * <class> is "transport" (no HTTP 200 answer in time: name, connection,
- * timeout, HTTP error, too many requests in flight), "response" (an answer
- * which is not a successful OCSP response) or "verify" (the response, or
- * the certificate, could not be checked: no responder URL, no issuer,
- * signature or signer, no status for the certificate, times).  These words
- * are a contract with Taranac, as is the "ca_policy: N entries" marker.  Do
- * not change them without Taranac.
+ * <class> is one of:
+ *  - transport	no usable answer in time: name, connection, timeout,
+ *		HTTP status other than 200, not a DER OCSP response.
+ *  - busy	the slots of this tls-config are taken (FR_TLS_CA_POLICY_OCSP_
+ *		INFLIGHT in flight and WAITERS waiting, or no slot within
+ *		SLOT_WAIT).  Says nothing about this responder.
+ *  - response	the responder answered with responseStatus other than
+ *		successful (tryLater, unauthorized, ...), or not with a basic
+ *		response.
+ *  - verify	the response does not hold: signature or signer, no status
+ *		for the certificate, times.
+ *  - config	the check could not be made here: no responder URL, no
+ *		issuer, the chain could not be looked at, out of memory, not
+ *		initialised.
+ *
+ * "ocsp verdict", the three verdicts and the five classes are a contract
+ * with Taranac, as is the "ca_policy: N entries" marker.  Do not change them
+ * without Taranac.
  *
  * TLS-OCSP-Cert-Valid is set to 1 (good), 0 (reject) or 2 (not needed).
  *
@@ -417,7 +588,7 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 	time_t			deadline;
 	long			left;
 	bool			slot = false;
-	int			status = -1, reason = -1, rcode;
+	int			status = -1, reason = -1, rcode, err;
 	ASN1_GENERALIZEDTIME	*rev = NULL, *thisupd = NULL, *nextupd = NULL;
 	char			t1[32], t2[32];
 	VALUE_PAIR		*vp;
@@ -428,11 +599,10 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 	 *	Whatever OpenSSL leaves on the error queue from here on
 	 *	must not be mistaken for an error of the handshake.
 	 */
-	ERR_set_mark();
-
 	memset(&out, 0, sizeof(out));
 	out.result = FR_TLS_CA_POLICY_OCSP_FAILED;
 	out.err_before = ERR_peek_last_error();
+	ERR_set_mark();
 
 	switch (tls_ca_policy_chain_find(request, conf, ctx, FR_TLS_CA_POLICY_OCSP, &line)) {
 	case 0:
@@ -444,12 +614,12 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 		break;
 
 	default:
-		REJECT_VERIFY("cannot evaluate the chain");
+		REJECT_CONFIG("cannot evaluate the chain");
 		goto done;
 	}
 
 	if (!conf->ocsp_store || !conf->ca_policy_ocsp_slots) {
-		REJECT_VERIFY("per-CA OCSP is not initialised");
+		REJECT_CONFIG("per-CA OCSP is not initialised");
 		goto done;
 	}
 
@@ -461,7 +631,7 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 	 */
 	chain = X509_STORE_CTX_get0_chain(ctx);
 	if (!chain || (sk_X509_num(chain) < 1)) {
-		REJECT_VERIFY("cannot evaluate the chain");
+		REJECT_CONFIG("cannot evaluate the chain");
 		goto done;
 	}
 	if (sk_X509_num(chain) > 1) {
@@ -471,18 +641,18 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 		issuer = issuer_owned;
 		certs = sk_X509_dup(chain);
 		if (!certs || !sk_X509_push(certs, issuer)) {
-			REJECT_VERIFY("out of memory");
+			REJECT_CONFIG("out of memory");
 			goto done;
 		}
 	}
 	if (!issuer) {
-		REJECT_VERIFY("no issuer certificate");
+		REJECT_CONFIG("no issuer certificate");
 		goto done;
 	}
 
 	tmp = talloc_new(request);
 	if (!tmp) {
-		REJECT_VERIFY("out of memory");
+		REJECT_CONFIG("out of memory");
 		goto done;
 	}
 
@@ -494,11 +664,22 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 		host = line->ocsp_host;
 		port = line->ocsp_port;
 		path = line->ocsp_path;
-	} else if (ocsp_aia_url(request, tmp, leaf, &url, &host, &port, &path) < 0) {
-		url = NULL;
-		REJECT_VERIFY("no OCSP responder URL (none configured for the CA, "
-			      "no http OCSP entry in the certificate's AIA)");
-		goto done;
+	} else {
+		switch (ocsp_aia_url(request, tmp, leaf, &url, &host, &port, &path)) {
+		case 0:
+			break;
+
+		case -2:
+			url = NULL;
+			REJECT_CONFIG("out of memory");
+			goto done;
+
+		default:
+			url = NULL;
+			REJECT_CONFIG("no OCSP responder URL (none configured for the CA, "
+				      "no http OCSP entry in the certificate's AIA)");
+			goto done;
+		}
 	}
 
 	RDEBUG2("(TLS) %s - ca_policy: OCSP request to %s (%s)", conf->name, url,
@@ -512,20 +693,20 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 	if (!req || !certid) {
 		OCSP_CERTID_free(certid);
 		certid = NULL;
-		REJECT_VERIFY("cannot build the OCSP request");
+		REJECT_CONFIG("cannot build the OCSP request");
 		goto done;
 	}
 	if (!OCSP_request_add0_id(req, certid)) {
 		OCSP_CERTID_free(certid);
 		certid = NULL;
-		REJECT_VERIFY("cannot build the OCSP request");
+		REJECT_CONFIG("cannot build the OCSP request");
 		goto done;
 	}
 	/* certid now belongs to req, and lives as long as it does */
 
 	req_bio = ASN1_item_i2d_mem_bio(ASN1_ITEM_rptr(OCSP_REQUEST), (ASN1_VALUE const *) req);
 	if (!req_bio) {
-		REJECT_VERIFY("cannot encode the OCSP request");
+		REJECT_CONFIG("cannot encode the OCSP request");
 		goto done;
 	}
 
@@ -533,12 +714,25 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 	 *	Taken before the name is resolved, so that a hung
 	 *	resolver holds no more than the slots.
 	 */
-	if (!ocsp_slot_take(conf)) {
-		REJECT_TRANSPORT("%d OCSP requests already in progress (the responder is slow or unreachable)",
-				 FR_TLS_CA_POLICY_OCSP_INFLIGHT);
+	switch (ocsp_slot_take(conf, &err)) {
+	case OCSP_SLOT_TAKEN:
+		slot = true;
+		break;
+
+	case OCSP_SLOT_FULL:
+		REJECT_BUSY("%d OCSP requests in progress and %d waiting for this tls-config",
+			    FR_TLS_CA_POLICY_OCSP_INFLIGHT, FR_TLS_CA_POLICY_OCSP_WAITERS);
+		goto done;
+
+	case OCSP_SLOT_TIMEOUT:
+		REJECT_BUSY("%d OCSP requests in progress for this tls-config, none finished within %d s",
+			    FR_TLS_CA_POLICY_OCSP_INFLIGHT, FR_TLS_CA_POLICY_OCSP_SLOT_WAIT);
+		goto done;
+
+	case OCSP_SLOT_ERROR:
+		REJECT_CONFIG("cannot wait for an OCSP slot: %s", fr_syserror(err));
 		goto done;
 	}
-	slot = true;
 
 	/*
 	 *	One deadline for everything.  OSSL_HTTP_transfer() would
@@ -551,7 +745,7 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 	 */
 	left = (long) (deadline - time(NULL));
 	if (left <= 0) {
-		REJECT_TRANSPORT("timed out waiting for a free OCSP slot");
+		REJECT_BUSY("no time left for the OCSP request after waiting for a slot");
 		goto done;
 	}
 
@@ -569,7 +763,7 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 
 	if (!OSSL_HTTP_set1_request(rctx, path, NULL, "application/ocsp-request", req_bio,
 				    NULL, 1, FR_TLS_CA_POLICY_OCSP_MAX_RESP, (int) left, 0)) {
-		REJECT_TRANSPORT("cannot set up the HTTP request");
+		REJECT_CONFIG("cannot set up the HTTP request");
 		goto done;
 	}
 
@@ -586,7 +780,7 @@ fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_
 
 	resp = d2i_OCSP_RESPONSE_bio(resp_bio, NULL);
 	if (!resp) {
-		REJECT_RESPONSE("the answer is not a DER OCSP response");
+		REJECT_TRANSPORT("the answer is not a DER OCSP response");
 		goto done;
 	}
 
@@ -677,7 +871,7 @@ done:
 
 	case FR_TLS_CA_POLICY_OCSP_FAILED:
 		if (vp) vp->vp_integer = 0;	/* no */
-		if (!out.verdict) out.verdict = "failed verify";	/* not reached */
+		if (!out.verdict) out.verdict = "failed config";	/* not reached */
 		X509_STORE_CTX_set_error(ctx, out.x509_err ? out.x509_err : OCSP_X509_ERR_FAILED);
 		RERROR("(TLS) ocsp verdict %s: %s; responder %s", out.verdict, out.detail, url ? url : "none");
 		break;

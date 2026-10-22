@@ -63,6 +63,7 @@ typedef struct fr_tls_server_conf_t fr_tls_server_conf_t;
 #define FR_TLS_CA_POLICY_OCSP_TIMEOUT	(3)		//!< Seconds for one OCSP check, slot wait included.
 #define FR_TLS_CA_POLICY_OCSP_SLOT_WAIT	(1)		//!< Seconds to wait for a free slot, out of the above.
 #define FR_TLS_CA_POLICY_OCSP_INFLIGHT	(4)		//!< OCSP requests at a time, per tls-config.
+#define FR_TLS_CA_POLICY_OCSP_WAITERS	(4)		//!< Checks waiting for a slot, per tls-config; more: "busy".
 #define FR_TLS_CA_POLICY_OCSP_MAX_RESP	(65536)		//!< Largest OCSP response read, in bytes.
 
 /** One parsed "ca_policy" line
@@ -462,7 +463,7 @@ struct fr_tls_server_conf_t {
 	uint32_t	ca_policy_logged_num;		//!< Under mutex, reset when the store is re-created.
 	uint8_t		ca_policy_logged[FR_TLS_CA_POLICY_LOGGED_MAX][FR_TLS_CA_POLICY_KEY_LEN];
 	uint32_t	ca_policy_ocsp_num;		//!< Lines with "ocsp".  Uses ocsp_store, not "ocsp { }".
-	fr_tls_ca_policy_ocsp_slots_t *ca_policy_ocsp_slots;	//!< Requests in flight, under mutex.
+	fr_tls_ca_policy_ocsp_slots_t *ca_policy_ocsp_slots;	//!< Requests in flight and waiting, under mutex.
 	char const	*check_cert_cn;
 	char const	*cipher_list;
 	char const	*cipher_suites;
