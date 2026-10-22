@@ -525,7 +525,9 @@ eap {
 		#	transport	no usable answer in time: name,
 		#			connection, timeout, HTTP status
 		#			other than 200, not a DER OCSP
-		#			response
+		#			response (OpenSSL 3.5 reads the
+		#			body of an HTTP error, which is
+		#			then checked like any answer)
 		#	busy		the 8 slots and 8 waiting places
 		#			of this tls-config are taken, or no
 		#			slot came free within 1 second; says
