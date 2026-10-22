@@ -546,7 +546,9 @@ static int ocsp_aia_url(REQUEST *request, TALLOC_CTX *ctx, X509 *leaf, char cons
  *
  * <class> is one of:
  *  - transport	no usable answer in time: name, connection, timeout,
- *		HTTP status other than 200, not a DER OCSP response.
+ *		HTTP status other than 200, not a DER OCSP response.  OpenSSL
+ *		3.5 reads the body of an answer with status 400 or more, and
+ *		that body is then checked like any other answer.
  *  - busy	the slots of this tls-config are taken (FR_TLS_CA_POLICY_OCSP_
  *		INFLIGHT in flight and WAITERS waiting, or no slot within
  *		SLOT_WAIT).  Says nothing about this responder.
