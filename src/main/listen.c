@@ -3100,6 +3100,7 @@ fr_protocol_t master_listen[RAD_LISTEN_MAX] = {
 static int listen_bind(rad_listen_t *this)
 {
 	int rcode;
+	bool inherited = false;
 	struct sockaddr_storage salocal;
 	socklen_t	salen;
 	listen_socket_t *sock = this->data;
@@ -3206,9 +3207,35 @@ static int listen_bind(rad_listen_t *this)
 	}
 
 	/*
+	 *	A supervising process may own the sockets for auth, acct
+	 *	and status listeners.  If so, the socket it handed us is
+	 *	already bound, and there is no other one.
+	 */
+	if (fr_inherit_active() &&
+	    ((this->type == RAD_LISTEN_AUTH) || (this->type == RAD_LISTEN_ACCT) ||
+	     (this->type == RAD_LISTEN_NONE))) {
+		char buffer[256];
+
+		this->print(this, buffer, sizeof(buffer));
+
+		if (sock->interface) {
+			ERROR("listen %s: an inherited socket cannot be bound to interface %s",
+			      buffer, sock->interface);
+			return -1;
+		}
+
+		this->fd = fr_inherit_take(&sock->my_ipaddr, sock->my_port, sock_type);
+		if (this->fd < 0) {
+			ERROR("listen %s %s", buffer, fr_strerror());
+			return -1;
+		}
+		inherited = true;
+	}
+
+	/*
 	 *	Copy fr_socket() here, as we may need to bind to a device.
 	 */
-	this->fd = socket(sock->my_ipaddr.af, sock_type, 0);
+	if (!inherited) this->fd = socket(sock->my_ipaddr.af, sock_type, 0);
 	if (this->fd < 0) {
 		char buffer[256];
 
@@ -3376,7 +3403,7 @@ static int listen_bind(rad_listen_t *this)
 		 */
 #ifdef IPV6_V6ONLY
 
-		if (IN6_IS_ADDR_UNSPECIFIED(&sock->my_ipaddr.ipaddr.ip6addr)) {
+		if (!inherited && IN6_IS_ADDR_UNSPECIFIED(&sock->my_ipaddr.ipaddr.ip6addr)) {
 			int on = 1;
 
 			if (setsockopt(this->fd, IPPROTO_IPV6, IPV6_V6ONLY,
@@ -3458,9 +3485,10 @@ static int listen_bind(rad_listen_t *this)
 #endif
 
 	/*
-	 *	May be binding to priviledged ports.
+	 *	May be binding to priviledged ports.  An inherited
+	 *	socket is bound already.
 	 */
-	if (sock->my_port != 0) {
+	if (!inherited && (sock->my_port != 0)) {
 		rad_suid_up();
 		rcode = bind(this->fd, (struct sockaddr *) &salocal, salen);
 		rad_suid_down();
