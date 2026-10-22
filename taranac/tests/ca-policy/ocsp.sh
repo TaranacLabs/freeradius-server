@@ -276,7 +276,14 @@ sc35() {
 	for rs in tryLater:trylater unauthorized:unauthorized internalError:internalerror malformedRequest:malformedrequest sigRequired:sigrequired; do
 		ostate "{\"resp_status\": \"${rs%%:*}\"}"; oprobe "${rs%%:*}" s-ok; expect_o "${rs%%:*}" "failed response" 1 "answered ${rs#*:}"
 	done
-	ostate '{"http_status": 500}'; oprobe http-500 s-ok; expect_o http-500 "failed transport" 1 "no HTTP 200"
+	# OpenSSL 3.5 returns the body of an answer with status >= 400 (and the body is then checked
+	# like any answer: here a good, signed one); before 3.5 the status alone fails the exchange
+	if [ "$(openssl version | awk '{ split($2, v, "."); print (v[1] > 3 || (v[1] == 3 && v[2] >= 5)) }')" = 1 ]; then
+		ostate '{"http_status": 500}'; oprobe http-500 s-ok; expect_o http-500 good 1
+	else
+		ostate '{"http_status": 500}'; oprobe http-500 s-ok; expect_o http-500 "failed transport" 1 "no HTTP 200"
+	fi
+	ostate '{"http_status": 500, "body": "garbage"}'; oprobe http-500-not-der s-ok; expect_o http-500-not-der "failed transport" 1
 	ostate '{"body": "garbage"}'; oprobe not-der s-ok; expect_o not-der "failed transport" 1
 	srv_stop
 }
@@ -486,7 +493,7 @@ sc48() {
 	need_ocsp || return
 	ocsp_conf "R S R2 P I U" "${H[S]} ocsp ocsp_url=$OA" "${H[I]} ocsp ocsp_url=$OB" "${H[U]} ocsp"; THREADS=8
 	srv_start 48 || return
-	local kinds=('{"http_status": 500}|failed transport' '{"body": "garbage"}|failed transport' '{"resp_status": "tryLater"}|failed response'
+	local kinds=('{"http_status": 500, "body": "garbage"}|failed transport' '{"body": "garbage"}|failed transport' '{"resp_status": "tryLater"}|failed response'
 		'{"signer": "ocsp-s-noeku"}|failed verify' '{"status": {"s-ok": "revoked"}}|revoked' '{"status": {"s-ok": "unknown"}}|unknown')
 	local k st want n=${LEAK_N:-100} r bad="" j=0
 	for k in "${kinds[@]}"; do

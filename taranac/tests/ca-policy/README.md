@@ -134,7 +134,7 @@ or nothing.
 | 32 | U not listed; R listed (CertID of S); responder serving only S / only R; R2->P->I with P listed, responder serving I / P | 0 requests Accept; good; good / failed response (unauthorized); good / failed response |
 | 33 | URL: override with an AIA (used), caIssuers only + URL, no AIA + URL; no URL and no AIA, caIssuers only, https only; ldap then http; Microsoft layout (OCSP third) | good x3; failed config, 0 requests x3, "responder none"; the http entry; good |
 | 34 | responder without nonce | Accept; the request has no nonce, SHA-1 CertID |
-| 35 | tryLater, unauthorized, internalError, malformedRequest, sigRequired; HTTP 500; not DER | failed response x5; failed transport x2 |
+| 35 | tryLater, unauthorized, internalError, malformedRequest, sigRequired; HTTP 500 with a good body; HTTP 500 and not DER; not DER | failed response x5; failed transport (OpenSSL < 3.5) or good (3.5 reads the body of an error); failed transport x2 |
 | 36 | signer: CA with / without its certificate, delegate with / without nocheck; delegate without EKU, bad signature, delegate of another CA, the leaf (with / without its certificate); status for another serial only | good x4; failed verify x6 |
 | 37 | nextUpdate -10 / -2 min, thisUpdate +10 / +2 min, no nextUpdate and 1 h / 2 min old | failed verify / good, alternating |
 | 38 | refused, black hole, silent, 1 byte per 0.5 s, NXDOMAIN | failed transport within 5.5 / 4.5 / 4.5 / 4.5 / 5.5 s; times recorded |
