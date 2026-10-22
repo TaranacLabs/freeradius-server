@@ -357,6 +357,12 @@ int main(int argc, char *argv[])
 	if (main_config_init() < 0) exit(EXIT_FAILURE);
 
 	/*
+	 *  Pick up listen sockets handed over by a supervising
+	 *  process, before any module can start a child.
+	 */
+	if (fr_inherit_init() < 0) exit(EXIT_FAILURE);
+
+	/*
 	 *  This is very useful in figuring out why the panic_action didn't fire.
 	 */
 	INFO("%s", fr_debug_state_to_msg(fr_debug_state));
@@ -655,6 +661,12 @@ int main(int argc, char *argv[])
 	 *  Initialise the state rbtree (used to link multiple rounds of challenges).
 	 */
 	state = fr_state_init(NULL);
+
+	/*
+	 *  Tell a supervising process that we are about to process
+	 *  requests.
+	 */
+	fr_inherit_ready();
 
 #ifdef HAVE_SYSTEMD
 	{
