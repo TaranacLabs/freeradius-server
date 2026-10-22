@@ -48,9 +48,22 @@ extern "C" {
 
 typedef struct fr_tls_server_conf_t fr_tls_server_conf_t;
 
+/*
+ *	Per-CA OCSP ("ca_policy" flag "ocsp") is built on the OSSL_HTTP_*
+ *	client of OpenSSL 3.0.  Without it, the flag is a parse error.
+ */
+#if defined(HAVE_OPENSSL_OCSP_H) && (OPENSSL_VERSION_NUMBER >= 0x30000000L) && !defined(LIBRESSL_VERSION_NUMBER)
+#  define WITH_TLS_CA_POLICY_OCSP (1)
+#endif
+
 #define FR_TLS_CA_POLICY_KEY_LEN	(32)		//!< SHA-256 of the CA's SubjectPublicKeyInfo.
 #define FR_TLS_CA_POLICY_LOGGED_MAX	(64)		//!< Issuers remembered as logged, per store.
 #define FR_TLS_CA_POLICY_CRL		(1 << 0)	//!< The CA has a CRL: CRL errors stand.
+#define FR_TLS_CA_POLICY_OCSP		(1 << 1)	//!< Leaves under the CA are checked with OCSP.
+#define FR_TLS_CA_POLICY_OCSP_TIMEOUT	(3)		//!< Seconds for one OCSP check, slot wait included.
+#define FR_TLS_CA_POLICY_OCSP_SLOT_WAIT	(1)		//!< Seconds to wait for a free slot, out of the above.
+#define FR_TLS_CA_POLICY_OCSP_INFLIGHT	(4)		//!< OCSP requests at a time, per tls-config.
+#define FR_TLS_CA_POLICY_OCSP_MAX_RESP	(65536)		//!< Largest OCSP response read, in bytes.
 
 /** One parsed "ca_policy" line
  *
@@ -58,7 +71,22 @@ typedef struct fr_tls_server_conf_t fr_tls_server_conf_t;
 typedef struct fr_tls_ca_policy_t {
 	uint8_t		spki[FR_TLS_CA_POLICY_KEY_LEN];
 	uint32_t	flags;
+	char const	*ocsp_url;			//!< "ocsp_url=", as given.  NULL: from the leaf's AIA.
+	char const	*ocsp_host;			//!< Parsed out of ocsp_url once, at startup.
+	char const	*ocsp_port;
+	char const	*ocsp_path;
 } fr_tls_ca_policy_t;
+
+/** Outcome of the per-CA OCSP check
+ *
+ */
+typedef enum {
+	FR_TLS_CA_POLICY_OCSP_FAILED = 0,		//!< Reject: revoked, unknown, or not checked.
+	FR_TLS_CA_POLICY_OCSP_GOOD,			//!< The responder said "good".
+	FR_TLS_CA_POLICY_OCSP_NOT_NEEDED		//!< No CA in the chain has "ocsp".
+} fr_tls_ca_policy_ocsp_t;
+
+typedef struct fr_tls_ca_policy_ocsp_slots_t fr_tls_ca_policy_ocsp_slots_t;
 
 typedef enum {
 	FR_TLS_INVALID = 0,	  		//!< Invalid, don't reply.
@@ -350,7 +378,14 @@ bool		tls_ca_policy_clears(REQUEST *request, fr_tls_server_conf_t *conf, X509_ST
 void		tls_ca_policy_verified(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx);
 int		tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx,
 					uint32_t flag);
+int		tls_ca_policy_chain_find(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx,
+					 uint32_t flag, fr_tls_ca_policy_t const **out);
 void		tls_ca_policy_store_reset(fr_tls_server_conf_t *conf);
+int		tls_ca_policy_ocsp_init(fr_tls_server_conf_t *conf);
+int		tls_ca_policy_ocsp_url_parse(TALLOC_CTX *ctx, char const *url, char const **host, char const **port,
+					     char const **path);
+fr_tls_ca_policy_ocsp_t tls_ca_policy_ocsp(REQUEST *request, fr_tls_server_conf_t *conf, X509_STORE_CTX *ctx,
+					   X509 *leaf);
 SSL_CTX		*tls_init_ctx(fr_tls_server_conf_t *conf, int client, char const *chain_file, char const *private_key_file);
 int 		tls_handshake_recv(REQUEST *, tls_session_t *ssn);
 int 		tls_handshake_send(REQUEST *, tls_session_t *ssn);
@@ -426,6 +461,8 @@ struct fr_tls_server_conf_t {
 	uint32_t	ca_policy_num;
 	uint32_t	ca_policy_logged_num;		//!< Under mutex, reset when the store is re-created.
 	uint8_t		ca_policy_logged[FR_TLS_CA_POLICY_LOGGED_MAX][FR_TLS_CA_POLICY_KEY_LEN];
+	uint32_t	ca_policy_ocsp_num;		//!< Lines with "ocsp".  Uses ocsp_store, not "ocsp { }".
+	fr_tls_ca_policy_ocsp_slots_t *ca_policy_ocsp_slots;	//!< Requests in flight, under mutex.
 	char const	*check_cert_cn;
 	char const	*cipher_list;
 	char const	*cipher_suites;

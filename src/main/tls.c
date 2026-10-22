@@ -3494,6 +3494,27 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L && defined(HAVE_OPENSSL_OCSP_H)
 		if (my_ok) {
+#ifdef WITH_TLS_CA_POLICY_OCSP
+			/*
+			 *	Per-CA OCSP (ca_policy).  Mutually exclusive
+			 *	with "ocsp { enable }", see tls_ca_policy.c.
+			 */
+			if (conf->ca_policy_ocsp_num) {
+				switch (tls_ca_policy_ocsp(request, conf, ctx, client_cert)) {
+				case FR_TLS_CA_POLICY_OCSP_GOOD:
+					do_verify = !conf->verify_skip_if_ocsp_ok;
+					break;
+
+				case FR_TLS_CA_POLICY_OCSP_NOT_NEEDED:
+					do_verify = true;
+					break;
+
+				case FR_TLS_CA_POLICY_OCSP_FAILED:
+					my_ok = 0;
+					break;
+				}
+			} else
+#endif
 			/*
 			 *	No OCSP, allow external verification.
 			 */
@@ -5042,6 +5063,11 @@ skip_list:
 		conf->ocsp_store = fr_init_x509_store(conf);
 		if (conf->ocsp_store == NULL) goto error;
 	}
+#ifdef WITH_TLS_CA_POLICY_OCSP
+	else if (conf->ca_policy_ocsp_num) {
+		if (tls_ca_policy_ocsp_init(conf) < 0) goto error;	/* ocsp_store without CRL flags */
+	}
+#endif
 #endif /*HAVE_OPENSSL_OCSP_H*/
 
 	{

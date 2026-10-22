@@ -14,7 +14,7 @@ TGT_PREREQS := libfreeradius-eap.a libfreeradius-server.a libfreeradius-radius.a
 TGT_LDLIBS  := $(LIBS)
 
 ifneq ($(OPENSSL_LIBS),)
-SOURCES += ${top_srcdir}/src/main/cb.c ${top_srcdir}/src/main/tls.c ${top_srcdir}/src/main/tls_ca_policy.c
+SOURCES += ${top_srcdir}/src/main/cb.c ${top_srcdir}/src/main/tls.c ${top_srcdir}/src/main/tls_ca_policy.c ${top_srcdir}/src/main/tls_ca_policy_ocsp.c
 TGT_LDLIBS  += $(OPENSSL_LIBS)
 endif
 

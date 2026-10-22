@@ -18,7 +18,7 @@
  * $Id$
  *
  * @file tls_ca_policy.c
- * @brief Per-CA revocation policy for "check_crl".
+ * @brief Per-CA revocation policy for "check_crl", and the CA lookup of per-CA OCSP.
  *
  * With "check_crl = yes" OpenSSL wants a CRL from the issuer of every
  * client certificate.  "ca_policy" lines name the CAs which do have a
@@ -27,6 +27,9 @@
  * errors stay as they are.  If none is, a fixed set of "no usable CRL"
  * errors is cleared, and every other check (signatures, validity,
  * trust, purpose, and CERT_REVOKED itself) still applies.
+ *
+ * The same lines can name, with the flag "ocsp", the CAs whose client
+ * certificates are checked with OCSP; see tls_ca_policy_ocsp.c.
  *
  * The policy is parsed once, with the rest of the tls-config section,
  * and lives as long as the configuration does.
@@ -78,16 +81,27 @@ static int ca_policy_spki_sha256(X509 *cert, uint8_t out[FR_TLS_CA_POLICY_KEY_LE
 
 /** Parse one "ca_policy" value: "<64 hex> <flag> [<flag>...]"
  *
+ * Flags are "crl", "ocsp" and "ocsp_url=<http URL>", in any order.  The
+ * value of "ocsp_url" runs to the next white space and is split off at the
+ * first '=' only, so the URL itself may have one (in a query).
+ *
  * Every error is fatal.  A token we do not know is an error and not a
  * warning, so that a configuration written for a newer binary fails the
  * "radiusd -C" check instead of being half applied.
+ *
+ * @param[in] ctx	talloc parent of the strings of the entry.
+ * @param[out] entry	the parsed line.
+ * @param[in] value	of the pair.
  */
-static int ca_policy_entry_parse(fr_tls_ca_policy_t *entry, char const *value)
+static int ca_policy_entry_parse(TALLOC_CTX *ctx, fr_tls_ca_policy_t *entry, char const *value)
 {
 	char const	*p = value;
 	char const	*tok;
 	size_t		len;
 
+#ifndef WITH_TLS_CA_POLICY_OCSP
+	(void) ctx;	/* only holds the OCSP strings */
+#endif
 	memset(entry, 0, sizeof(*entry));
 
 	while (isspace((uint8_t) *p)) p++;
@@ -136,12 +150,63 @@ static int ca_policy_entry_parse(fr_tls_ca_policy_t *entry, char const *value)
 			continue;
 		}
 
+		if (((eq ? (size_t) (eq - tok) : len) == 4) && (strncmp(tok, "ocsp", 4) == 0)) {
+			if (eq) {
+				fr_strerror_printf("flag 'ocsp' takes no value (the responder is 'ocsp_url=')");
+				return -1;
+			}
+			if (entry->flags & FR_TLS_CA_POLICY_OCSP) {
+				fr_strerror_printf("flag 'ocsp' given twice");
+				return -1;
+			}
+#ifndef WITH_TLS_CA_POLICY_OCSP
+			fr_strerror_printf("per-CA OCSP needs OpenSSL 3.0");
+			return -1;
+#else
+			entry->flags |= FR_TLS_CA_POLICY_OCSP;
+			continue;
+#endif
+		}
+
+		if (((eq ? (size_t) (eq - tok) : len) == 8) && (strncmp(tok, "ocsp_url", 8) == 0)) {
+			if (!eq) {
+				fr_strerror_printf("flag 'ocsp_url' needs a value (ocsp_url=<http URL>)");
+				return -1;
+			}
+			if (entry->ocsp_url) {
+				fr_strerror_printf("flag 'ocsp_url' given twice");
+				return -1;
+			}
+			if ((size_t) (eq - tok) + 1 == len) {
+				fr_strerror_printf("flag 'ocsp_url' has an empty URL");
+				return -1;
+			}
+#ifndef WITH_TLS_CA_POLICY_OCSP
+			fr_strerror_printf("per-CA OCSP needs OpenSSL 3.0");
+			return -1;
+#else
+			entry->ocsp_url = talloc_strndup(ctx, eq + 1, len - (eq - tok) - 1);
+			if (!entry->ocsp_url) {
+				fr_strerror_printf("out of memory");
+				return -1;
+			}
+			if (tls_ca_policy_ocsp_url_parse(ctx, entry->ocsp_url, &entry->ocsp_host,
+							 &entry->ocsp_port, &entry->ocsp_path) < 0) return -1;
+			continue;
+#endif
+		}
+
 		fr_strerror_printf("unknown flag '%.*s'", (int) len, tok);
 		return -1;
 	}
 
+	if (entry->ocsp_url && !(entry->flags & FR_TLS_CA_POLICY_OCSP)) {
+		fr_strerror_printf("flag 'ocsp_url' needs the flag 'ocsp'");
+		return -1;
+	}
+
 	if (!entry->flags) {
-		fr_strerror_printf("no flags after the key hash (expected 'crl')");
+		fr_strerror_printf("no flags after the key hash (expected 'crl' or 'ocsp')");
 		return -1;
 	}
 
@@ -188,7 +253,7 @@ static fr_tls_ca_policy_t const *ca_policy_find(fr_tls_server_conf_t const *conf
 int tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs)
 {
 	CONF_PAIR	*cp;
-	uint32_t	n = 0, i = 0, j;
+	uint32_t	n = 0, i = 0, j, crl_num = 0, ocsp_num = 0;
 	char const	*name2;
 
 	for (cp = cf_pair_find(cs, "ca_policy"); cp; cp = cf_pair_find_next(cs, cp, "ca_policy")) n++;
@@ -221,7 +286,7 @@ int tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs)
 			return -1;
 		}
 
-		if (ca_policy_entry_parse(&conf->ca_policy_entries[i], value) < 0) {
+		if (ca_policy_entry_parse(conf->ca_policy_entries, &conf->ca_policy_entries[i], value) < 0) {
 			cf_log_err_cp(cp, LOG_PREFIX ": ca_policy \"%s\": %s", value, fr_strerror());
 			return -1;
 		}
@@ -233,15 +298,39 @@ int tls_ca_policy_parse(fr_tls_server_conf_t *conf, CONF_SECTION *cs)
 				return -1;
 			}
 		}
+
+		/*
+		 *	Two OCSP semantics in one tls-config (per-CA
+		 *	here, every client certificate with its own
+		 *	url / override / softfail / nonce there) cannot
+		 *	be told apart by whoever reads the logs.
+		 *	"ocsp { enable }" is parsed by now.
+		 */
+		if (conf->ca_policy_entries[i].flags & FR_TLS_CA_POLICY_OCSP) {
+#ifdef HAVE_OPENSSL_OCSP_H
+			if (conf->ocsp_enable) {
+				cf_log_err_cp(cp, LOG_PREFIX ": ca_policy \"%s\": ca_policy ocsp and the ocsp section "
+					      "are mutually exclusive (set ocsp { enable = no })", value);
+				return -1;
+			}
+#endif
+			ocsp_num++;
+		}
+		if (conf->ca_policy_entries[i].flags & FR_TLS_CA_POLICY_CRL) crl_num++;
 		i++;
 	}
 	conf->ca_policy_num = n;
+	conf->ca_policy_ocsp_num = ocsp_num;
 
 	name2 = cf_section_name2(cs);
 	INFO(LOG_PREFIX ": ca_policy: %u entries in %s%s%s", n, cf_section_name1(cs), name2 ? " " : "", name2 ? name2 : "");
 
-	if (n && !conf->check_crl) {
-		WARN(LOG_PREFIX ": ca_policy has no effect without check_crl = yes");
+	/*
+	 *	Only "crl" needs check_crl.  "ocsp" works on its own.
+	 */
+	if (crl_num && !conf->check_crl) {
+		WARN(LOG_PREFIX ": ca_policy has no effect without check_crl = yes%s",
+		     ocsp_num ? " (the 'crl' flags; the 'ocsp' flags apply)" : "");
 	}
 
 	return 0;
@@ -320,10 +409,10 @@ void tls_ca_policy_store_reset(fr_tls_server_conf_t *conf)
 
 /** Hash a certificate's key and look it up
  *
- * @return 1 listed with the flag, 0 not listed, -1 the key cannot be hashed.
+ * @return 1 listed with the flag (*found is the line), 0 not listed, -1 the key cannot be hashed.
  */
 static int ca_policy_cert_listed(REQUEST *request, fr_tls_server_conf_t const *conf, X509 *cert, int depth,
-				 uint32_t flag)
+				 uint32_t flag, fr_tls_ca_policy_t const **found)
 {
 	uint8_t	spki[FR_TLS_CA_POLICY_KEY_LEN];
 	char	hex[(FR_TLS_CA_POLICY_KEY_LEN * 2) + 1];
@@ -333,7 +422,8 @@ static int ca_policy_cert_listed(REQUEST *request, fr_tls_server_conf_t const *c
 		return -1;
 	}
 
-	if (!ca_policy_find(conf, spki, flag)) return 0;
+	*found = ca_policy_find(conf, spki, flag);
+	if (!*found) return 0;
 
 	fr_bin2hex(hex, spki, sizeof(spki));
 	RDEBUG2("(TLS) %s - ca_policy: certificate %d in chain (key sha256:%s) is listed", conf->name, depth, hex);
@@ -348,10 +438,10 @@ static int ca_policy_cert_listed(REQUEST *request, fr_tls_server_conf_t const *c
  * nothing tells them apart short of checking the signature, so every
  * candidate which X509_check_issued() accepts counts: OR over all of them.
  *
- * @return 1 one of them is listed with the flag, 0 none is, -1 error.
+ * @return 1 one of them is listed with the flag (*found is the first one's line), 0 none is, -1 error.
  */
 static int ca_policy_issuers_listed(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx,
-				    X509 *cert, int depth, uint32_t flag)
+				    X509 *cert, int depth, uint32_t flag, fr_tls_ca_policy_t const **found)
 {
 	STACK_OF(X509)	*candidates;
 	int		i, rcode = 0;
@@ -364,7 +454,7 @@ static int ca_policy_issuers_listed(REQUEST *request, fr_tls_server_conf_t const
 
 		if (X509_check_issued(candidate, cert) != X509_V_OK) continue;
 
-		rcode = ca_policy_cert_listed(request, conf, candidate, depth, flag);
+		rcode = ca_policy_cert_listed(request, conf, candidate, depth, flag, found);
 		if (rcode != 0) break;
 	}
 	sk_X509_pop_free(candidates, X509_free);
@@ -378,7 +468,7 @@ static int ca_policy_issuers_listed(REQUEST *request, fr_tls_server_conf_t const
  */
 #define CA_POLICY_MAX_WALK (16)
 
-/** Is any certificate in the chain, up to its root, listed with a flag
+/** Find the nearest certificate in the chain, up to its root, listed with a flag
  *
  * The chain is the verified one, leaf included (so that a chain of one has
  * an answer).  The key of a certificate's real issuer is always in it at
@@ -401,15 +491,28 @@ static int ca_policy_issuers_listed(REQUEST *request, fr_tls_server_conf_t const
  * Any failure to hash a certificate or to look up an issuer is returned as
  * an error: callers must treat it as "listed" (fail closed).
  *
- * Not CRL specific: the OCSP per-CA flags are meant to use it too.
+ * The walk goes from the leaf up, so the line found is the one of the
+ * nearest listed CA: the one whose parameters (the OCSP responder) apply.
+ * On a level with several candidates, it is the first listed one in the
+ * order OpenSSL returns them.
  *
+ * @param[in] request	for debug output.
+ * @param[in] conf	with the parsed lines.
+ * @param[in] ctx	of the verification, after the chain was built.
+ * @param[in] flag	to look for (FR_TLS_CA_POLICY_*).
+ * @param[out] out	the line of the nearest listed CA, NULL if none
+ *			is or on error.  May be NULL.
  * @return 1 listed, 0 not listed, -1 error.
  */
-int tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx, uint32_t flag)
+int tls_ca_policy_chain_find(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx, uint32_t flag,
+			     fr_tls_ca_policy_t const **out)
 {
-	STACK_OF(X509)	*chain;
-	X509		*top, *owned = NULL;
-	int		i, num, rcode = 0;
+	STACK_OF(X509)		*chain;
+	X509			*top, *owned = NULL;
+	int			i, num, rcode = 0;
+	fr_tls_ca_policy_t const *line = NULL;
+
+	if (out) *out = NULL;
 
 	chain = X509_STORE_CTX_get0_chain(ctx);
 	if (!chain) return -1;
@@ -418,8 +521,8 @@ int tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, 
 	if (num <= 0) return -1;
 
 	for (i = 0; i < num; i++) {
-		rcode = ca_policy_cert_listed(request, conf, sk_X509_value(chain, i), i, flag);
-		if (rcode != 0) return rcode;
+		rcode = ca_policy_cert_listed(request, conf, sk_X509_value(chain, i), i, flag, &line);
+		if (rcode != 0) goto done;
 	}
 
 	/*
@@ -435,7 +538,7 @@ int tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, 
 
 		if (X509_check_issued(top, top) == X509_V_OK) break;	/* self-issued: a root */
 
-		rcode = ca_policy_issuers_listed(request, conf, ctx, top, i, flag);
+		rcode = ca_policy_issuers_listed(request, conf, ctx, top, i, flag, &line);
 		if (rcode != 0) break;
 
 		found = X509_STORE_CTX_get1_issuer(&up, ctx, top);
@@ -458,7 +561,21 @@ int tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, 
 	X509_free(owned);
 	ERR_pop_to_mark();
 
+done:
+	if (out && (rcode == 1)) *out = line;
+
 	return rcode;
+}
+
+/** Is any certificate in the chain, up to its root, listed with a flag
+ *
+ * See tls_ca_policy_chain_find().
+ *
+ * @return 1 listed, 0 not listed, -1 error.
+ */
+int tls_ca_policy_chain_has(REQUEST *request, fr_tls_server_conf_t const *conf, X509_STORE_CTX *ctx, uint32_t flag)
+{
+	return tls_ca_policy_chain_find(request, conf, ctx, flag, NULL);
 }
 
 /** Decide whether a CRL error for this chain is cleared by the policy
