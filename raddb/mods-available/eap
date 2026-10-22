@@ -369,7 +369,7 @@ eap {
 		#
 	#	allow_expired_crl = no
 
-		#  Per-CA revocation policy (Taranac fork).
+		#  Per-CA revocation policy (an addition of this fork).
 		#
 		#  With "check_crl = yes" alone, OpenSSL wants a CRL
 		#  from the issuer of EVERY client certificate, and
@@ -540,8 +540,7 @@ eap {
 		#
 		#  <time> is ISO 8601 UTC.  "ocsp verdict", the three
 		#  verdicts and the five classes are a contract, as the
-		#  line below is: Taranac reads them.  Do not change them
-		#  without Taranac.
+		#  line below is: tools parse them.  Do not change them.
 		#
 		#  Every server TLS configuration (an EAP tls-config, and
 		#  also the "tls" subsection of a listen or client section)
@@ -551,9 +550,9 @@ eap {
 		#
 		#  e.g. "tls: ca_policy: 2 entries in tls-config tls-nac",
 		#  also when N is 0.  This line is a contract: it is how
-		#  Taranac tells a binary which understands "ca_policy"
-		#  from one which silently ignores it.  Do not change
-		#  its wording without Taranac.
+		#  a tool which writes this configuration tells a binary
+		#  which understands "ca_policy" from one which silently
+		#  ignores it.  Do not change its wording.
 		#
 	#	ca_policy = "<64 hex digits> crl"
 	#	ca_policy = "<64 hex digits> crl ocsp"

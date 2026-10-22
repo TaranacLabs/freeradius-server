@@ -559,9 +559,9 @@ static int ocsp_aia_url(REQUEST *request, TALLOC_CTX *ctx, X509 *leaf, char cons
  *		issuer, the chain could not be looked at, out of memory, not
  *		initialised.
  *
- * "ocsp verdict", the three verdicts and the five classes are a contract
- * with Taranac, as is the "ca_policy: N entries" marker.  Do not change them
- * without Taranac.
+ * "ocsp verdict", the three verdicts and the five classes are parsed by
+ * consumers of the log, as is the "ca_policy: N entries" marker.  Do not
+ * change them.
  *
  * TLS-OCSP-Cert-Valid is set to 1 (good), 0 (reject) or 2 (not needed).
  *
