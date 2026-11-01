@@ -473,7 +473,7 @@ RADCLIENT *client_find(RADCLIENT_LIST const *clients, fr_ipaddr_t const *ipaddr,
 		if (!clients->trees[i]) continue;
 
 		data = rbtree_finddata(clients->trees[i], &myclient);
-		if (data) return data;
+		if (data && !((RADCLIENT *) data)->nas_id_only) return data;
 	}
 
 	return NULL;
@@ -1103,6 +1103,21 @@ RADCLIENT *client_afrom_cs(TALLOC_CTX *ctx, CONF_SECTION *cs, bool in_server, bo
 		FR_TIMEVAL_BOUND_CHECK("response_window", &c->response_window, >=, 0, 1000);
 		FR_TIMEVAL_BOUND_CHECK("response_window", &c->response_window, <=, 60, 0);
 		FR_TIMEVAL_BOUND_CHECK("response_window", &c->response_window, <=, main_config.max_request_time, 0);
+	}
+
+	/*
+	 *	"identify_by = nas_identifier": the secret is chosen by
+	 *	the NAS-Identifier of the packet (client_nas_id.c).
+	 */
+	switch (client_nas_id_parse(c, cs, in_server)) {
+	case 0:
+		break;
+
+	case 1:
+		return c;	/* no secret of its own */
+
+	default:
+		goto error;
 	}
 
 #ifdef WITH_DYNAMIC_CLIENTS

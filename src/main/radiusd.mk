@@ -1,6 +1,6 @@
 TARGET	:= radiusd
-SOURCES := acct.c auth.c client.c crypt.c files.c \
-		  listen.c  mainconfig.c modules.c modcall.c \
+SOURCES := acct.c auth.c client.c client_nas_id.c crypt.c files.c \
+		  listen.c listen_nas_id.c mainconfig.c modules.c modcall.c \
 		  radiusd.c state.c stats.c soh.c connection.c \
 		  session.c threads.c channel.c \
 		  process.c realms.c detail.c inherit.c
