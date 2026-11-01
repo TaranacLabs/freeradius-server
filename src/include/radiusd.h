@@ -598,6 +598,9 @@ void proxy_tls_close(rad_listen_t *listener);
 #endif
 RADCLIENT *client_listener_find(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port);
 
+/* listen_nas_id.c */
+RADCLIENT *client_nas_id_listener_find(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port);
+
 #ifdef WITH_STATS
 RADCLIENT_LIST *listener_find_client_list(fr_ipaddr_t const *ipaddr, uint16_t port, int proto);
 #endif
