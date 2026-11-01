@@ -2427,8 +2427,8 @@ static int auth_socket_recv(rad_listen_t *listener)
 		return 0;
 	}
 
-	if ((client = client_listener_find(listener,
-					   &src_ipaddr, src_port)) == NULL) {
+	if ((client = client_nas_id_listener_find(listener,
+						  &src_ipaddr, src_port)) == NULL) {
 		rad_recv_discard(listener->fd);
 		FR_STATS_INC(auth, total_invalid_requests);
 		return 0;
@@ -2549,8 +2549,8 @@ static int acct_socket_recv(rad_listen_t *listener)
 		return 0;
 	}
 
-	if ((client = client_listener_find(listener,
-					   &src_ipaddr, src_port)) == NULL) {
+	if ((client = client_nas_id_listener_find(listener,
+						  &src_ipaddr, src_port)) == NULL) {
 		rad_recv_discard(listener->fd);
 		FR_STATS_INC(acct, total_invalid_requests);
 		return 0;

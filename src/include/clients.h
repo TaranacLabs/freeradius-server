@@ -27,6 +27,7 @@
  */
 
 typedef struct radclient_list RADCLIENT_LIST;
+typedef struct client_nas_id client_nas_id_t;
 
 
 /** Describes a host allowed to send packets to the server
@@ -114,6 +115,10 @@ typedef struct radclient {
 							//!< Must be used exclusively from coa_server.
 	bool			defines_coa_server;	//!< Client also defines a home_server.
 #endif
+
+	client_nas_id_t		*nas_id;		//!< "identify_by = nas_identifier" entries (client_nas_id.c).
+	bool			nas_id_only;		//!< Has such entries and no secret of its own:
+							//!< client_find() skips it.
 } RADCLIENT;
 
 /** Callback for retrieving values when building client sections
@@ -165,6 +170,12 @@ RADCLIENT	*client_afrom_request(RADCLIENT_LIST *clients, REQUEST *request);
 int		client_map_section(CONF_SECTION *out, CONF_SECTION const *map, client_value_cb_t func, void *data);
 
 RADCLIENT	*client_afrom_cs(TALLOC_CTX *ctx, CONF_SECTION *cs, bool in_server, bool with_coa);
+
+int		client_nas_id_parse(RADCLIENT *c, CONF_SECTION *cs, bool in_server);
+bool		client_nas_id_configured(void);
+RADCLIENT	*client_nas_id_find(RADCLIENT_LIST const *clients, fr_ipaddr_t const *ipaddr,
+				    uint8_t const *value, size_t len);
+RADCLIENT	*client_nas_id_covering(RADCLIENT_LIST const *clients, fr_ipaddr_t const *ipaddr);
 
 RADCLIENT	*client_afrom_query(TALLOC_CTX *ctx, char const *identifier, char const *secret, char const *shortname,
 				    char const *type, char const *server)
