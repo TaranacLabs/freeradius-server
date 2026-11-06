@@ -2,7 +2,7 @@
 # identify_by = nas_identifier harness: radiusd with identify_by clients, probed with radclient
 # from several local source addresses.
 #
-#   run.sh <workdir> [scenario ...]        default: all (check errors main ratelimit stock)
+#   run.sh <workdir> [scenario ...]        default: all (check errors main ratelimit drops stock)
 #
 # Needs in PATH (or RADIUSD=/path, RADCLIENT=/path): radiusd and radclient built from the ref
 # under test, ip (iproute2 or busybox), and root with CAP_NET_ADMIN: the harness adds the source addresses
@@ -38,7 +38,7 @@ RADIUSD=${RADIUSD:-radiusd}
 RADCLIENT=${RADCLIENT:-radclient}
 DICTDIR=${DICTDIR:-/usr/share/freeradius}
 LIBDIR=${LIBDIR:-/usr/lib/freeradius}
-SCEN=${*:-check errors main ratelimit stock}
+SCEN=${*:-check errors main ratelimit drops stock}
 
 V4_SOURCES="10.77.0.1 10.77.0.5 10.77.0.9 10.66.0.1 10.66.0.2 10.55.0.1 10.88.0.1"
 V6_SOURCES="fd00:77::1"
@@ -572,6 +572,150 @@ client net77 {
 	probe $s "$d" "address client"                accept:net77 10.77.0.1:1812 auth net77-secret "$U" "$P" 'NAS-Identifier = "a"'
 	probe $s "$d" "address client, acct"          acct:net77   10.77.0.1:1813 acct net77-secret "$U" 'Acct-Status-Type = Start' 'NAS-Identifier = "a"'
 	probe $s "$d" "unknown source [regression]"   'drop:unknown client 10.66.0.1' 10.66.0.1:1812 auth secret-x-66 "$U" "$P" 'NAS-Identifier = "x"'
+	stop
+}
+
+# Drops which radiusd used to log only in debug mode: daemon mode (-f) must log them too, one
+# "Ignoring request ..." line per source and second, with the client and never the User-Name.
+CLIENTS_DROPS='
+client localhost {
+	ipaddr = 127.0.0.1
+	secret = testing123
+	shortname = localhost
+}
+client ma5 {
+	ipaddr = 10.77.0.5
+	secret = ma5-secret
+	shortname = ma5
+	require_message_authenticator = yes
+}
+client lps9 {
+	ipaddr = 10.77.0.9
+	secret = lps9-secret
+	shortname = lps9
+	require_message_authenticator = no
+	limit_proxy_state = yes
+}
+client p88 {
+	ipaddr = 10.88.0.1
+	secret = p88-secret
+	shortname = p88
+}
+client p6 {
+	ipv6addr = fd00:77::1
+	secret = p6-secret
+	shortname = p6
+}
+client site66 {
+	ipaddr = 10.66.0.0/24
+	identify_by = nas_identifier
+	nas_identifier "x" {
+		secret = "secret-x-66"
+		shortname = "sx"
+	}
+}
+'
+
+# raw <host> <port> <hex bytes...>: one UDP datagram (bash's /dev/udp); the host is a local
+# address, so it is also the source address radiusd sees.  The bytes go through a file and dd
+# (one read, one write): printf straight to the socket flushes at every 0x0a and would split the
+# datagram, and busybox cat sends nothing to an IPv6 /dev/udp socket.
+raw() {
+	local host=$1 port=$2 b fmt=
+	shift 2
+	for b in "$@"; do fmt="$fmt\\x$b"; done
+	printf "$fmt" >"$W/raw.bin"
+	dd if="$W/raw.bin" bs=4096 2>/dev/null >"/dev/udp/$host/$port"
+}
+
+AUTH16='00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00'
+
+# raw_drop <scenario> <dir> <case> <regex|-> <host> <port> <hex...>
+#   regex: the probe's slice of the log must match it; "-": no "Ignoring request" line at all.
+raw_drop() {
+	local s=$1 d=$2 c=$3 re=$4 host=$5 port=$6 n slice
+	shift 6
+	n=$(wc -l <"$d/radiusd.log")
+	raw "$host" "$port" "$@"
+	sleep 0.3
+	slice=$(tail -n +"$((n + 1))" "$d/radiusd.log")
+	printf '%s\n' "$slice" >"$d/probe-$(echo "$c" | tr -c 'A-Za-z0-9\n' '_').log"
+	if [ "$re" = - ]; then
+		if printf '%s\n' "$slice" | grep -q 'Ignoring request'; then
+			record "$s" "$c" "no line" "$(printf '%s\n' "$slice" | grep 'Ignoring request' | head -1)" FAIL
+		else
+			record "$s" "$c" "no line" "no line" PASS
+		fi
+	elif printf '%s\n' "$slice" | grep -Eq "$re"; then
+		record "$s" "$c" "line: $re" "line" PASS
+	else
+		record "$s" "$c" "line: $re" "log lacks it: $(printf '%s\n' "$slice" | head -1)" FAIL
+	fi
+}
+
+scenario_drops() {
+	local s=drops d=$W/drops i n
+	local UN='User-Name = "drop-user-7x"' A='Acct-Status-Type = Start'
+	local PFX='^.* : Error: Ignoring request to (auth|acct) address [^ ]+ port 181[23]( bound to server [a-z]+)? from client'
+	raddb "$d" "$CLIENTS_DROPS"
+	start "$d" "-f" || { record $s start ok failed FAIL; return; }
+
+	# one second between probes: every case below would otherwise hit the per-source limit
+	sleep 1.1
+	probe $s "$d" "no MA, require_message_authenticator"  "drop:$PFX 10.77.0.5 port [0-9]+: no Message-Authenticator, which client ma5 requires\$" 10.77.0.5:1812 auth ma5-secret "$UN" "$P" "$MA_OFF"
+	sleep 1.1
+	probe $s "$d" "no MA, NAS-Identifier entry"           "drop:$PFX 10.66.0.1 port [0-9]+: no Message-Authenticator, which client sx requires\$" 10.66.0.1:1812 auth secret-x-66 "$UN" "$P" 'NAS-Identifier = "x"' "$MA_OFF"
+	sleep 1.1
+	probe $s "$d" "Proxy-State, no MA, limit_proxy_state" "drop:$PFX 10.77.0.9 port [0-9]+: Proxy-State without Message-Authenticator, which client lps9 refuses \\(limit_proxy_state\\)\$" 10.77.0.9:1812 auth lps9-secret "$UN" "$P" 'Proxy-State = 0x01' "$MA_OFF"
+	sleep 1.1
+	probe $s "$d" "Status-Server without MA"              "drop:$PFX 10.88.0.1 port [0-9]+: Status-Server without Message-Authenticator, client p88\$" 10.88.0.1:1812 status p88-secret "$MA_OFF"
+	sleep 1.1
+	probe $s "$d" "control: no MA, plain client"          accept:p88 10.88.0.1:1812 auth p88-secret "$UN" "$P" "$MA_OFF"
+	sleep 1.1
+	probe $s "$d" "Accounting-Request to auth port"       "drop:$PFX 10.88.0.1 port [0-9]+: packet code 4 \\(Accounting-Request\\) is not accepted here, client p88\$" 10.88.0.1:1812 acct p88-secret "$UN" "$A"
+	sleep 1.1
+	probe $s "$d" "Access-Request to acct port"           "drop:$PFX 10.88.0.1 port [0-9]+: packet code 1 \\(Access-Request\\) is not accepted here, client p88\$" 10.88.0.1:1813 auth p88-secret "$UN" "$P"
+	sleep 1.1
+	raw_drop $s "$d" "unknown code 99 to auth port"       "$PFX 10.88.0.1 port [0-9]+: packet code 99 \\(unknown\\) is not accepted here, client p88\$" 10.88.0.1 1812 63 01 00 14 $AUTH16
+	sleep 1.1
+	raw_drop $s "$d" "attribute too short"                "$PFX 10.88.0.1 port [0-9]+: malformed packet \\(attribute too short\\), client p88\$" 10.88.0.1 1812 01 02 00 18 $AUTH16 01 01 00 00
+	sleep 1.1
+	raw_drop $s "$d" "acct: attribute 0"                  "$PFX 10.88.0.1 port [0-9]+: malformed packet \\(attribute 0\\), client p88\$" 10.88.0.1 1813 04 03 00 18 $AUTH16 00 04 41 41
+	sleep 1.1
+	raw_drop $s "$d" "attribute header overflow"          "$PFX 10.88.0.1 port [0-9]+: malformed packet \\(attribute header overflows the packet\\), client p88\$" 10.88.0.1 1812 01 04 00 15 $AUTH16 01
+	sleep 1.1
+	raw_drop $s "$d" "datagram shorter than Length"       "$PFX 10.88.0.1 port [0-9]+: malformed packet \\(shorter than its Length field\\), client p88\$" 10.88.0.1 1812 01 05 00 64 $AUTH16 01 04 41 41
+	sleep 1.1
+	raw_drop $s "$d" "Length field < 20"                  "$PFX 10.88.0.1 port [0-9]+: malformed packet \\(invalid header\\), client p88\$" 10.88.0.1 1812 01 06 00 0b 00 00 00 00 00 00 00
+	sleep 1.1
+	raw_drop $s "$d" "3-byte datagram"                    "$PFX 10.88.0.1 port [0-9]+: malformed packet \\(invalid header\\), client p88\$" 10.88.0.1 1812 01 07 00
+	sleep 1.1
+	raw_drop $s "$d" "IPv6: attribute too short"          "$PFX fd00:77::1 port [0-9]+: malformed packet \\(attribute too short\\), client p6\$" fd00:77::1 1812 01 08 00 18 $AUTH16 01 01 00 00
+	sleep 1.1
+	raw_drop $s "$d" "identify_by source: invalid header" "$PFX 10.66.0.1 port [0-9]+: malformed packet \\(invalid header\\), client site66\$" 10.66.0.1 1812 01 09 00 0b 00 00 00 00 00 00 00
+	sleep 1.1
+	raw_drop $s "$d" "identify_by source: bad attribute"  "$PFX 10.66.0.1 port [0-9]+: malformed packet\$" 10.66.0.1 1812 01 0c 00 18 $AUTH16 01 01 00 00
+	sleep 1.1
+	raw_drop $s "$d" "unknown source, bad header: no line" - 10.55.0.1 1812 01 0b 00 0b 00 00 00 00 00 00 00
+
+	# rate limit: 20 malformed packets from one source in a burst, one line (two if the burst
+	# crosses a second); the limiter is shared with the NAS-Identifier lines
+	sleep 1.1
+	n=$(grep -c 'from client 10.88.0.1 port .*: malformed packet' "$d/radiusd.log")
+	for i in $(seq 1 20); do raw 10.88.0.1 1812 01 0d 00 18 $AUTH16 01 01 00 00; done
+	sleep 0.3
+	n=$(($(grep -c 'from client 10.88.0.1 port .*: malformed packet' "$d/radiusd.log") - n))
+	if [ "$n" -ge 1 ] && [ "$n" -le 2 ]; then
+		record $s "20 drops from one source, one line" "1-2 lines" "$n lines" PASS
+	else
+		record $s "20 drops from one source, one line" "1-2 lines" "$n lines" FAIL
+	fi
+
+	if grep -q 'drop-user-7x' "$d/radiusd.log"; then
+		record $s "User-Name never logged" "absent" "present" FAIL
+	else
+		record $s "User-Name never logged" "absent" "absent" PASS
+	fi
 	stop
 }
 
