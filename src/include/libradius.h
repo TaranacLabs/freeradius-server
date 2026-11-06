@@ -552,6 +552,7 @@ bool		rad_packet_ok(RADIUS_PACKET *packet, int flags, decode_fail_t *reason);
  *	8 == require_ma for Access-* replies and Protocol-Error
  */
 RADIUS_PACKET	*rad_recv(TALLOC_CTX *ctx, int fd, int flags);
+RADIUS_PACKET	*rad_recv_reason(TALLOC_CTX *ctx, int fd, int flags, decode_fail_t *reason);
 ssize_t rad_recv_header(int sockfd, fr_ipaddr_t *src_ipaddr, uint16_t *src_port, int *code);
 void		rad_recv_discard(int sockfd);
 int		rad_verify(RADIUS_PACKET *packet, RADIUS_PACKET *original,

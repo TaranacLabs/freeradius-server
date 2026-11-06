@@ -2211,6 +2211,7 @@ static int auth_socket_recv(rad_listen_t *listener)
 	RADCLIENT	*client = NULL;
 	fr_ipaddr_t	src_ipaddr;
 	TALLOC_CTX	*ctx;
+	decode_fail_t	reason;
 
 	rcode = rad_recv_header(listener->fd, &src_ipaddr, &src_port, &code);
 	if (rcode < 0) return 0;
@@ -2220,6 +2221,9 @@ static int auth_socket_recv(rad_listen_t *listener)
 	if (rcode < 20) {	/* RADIUS_HDR_LEN */
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
 		FR_STATS_INC(auth, total_malformed_requests);
+		if ((rcode == 1) && (src_ipaddr.af != AF_UNSPEC)) {
+			listen_drop_log(listener, &src_ipaddr, src_port, NULL, 0, DECODE_FAIL_MAX);
+		}
 		return 0;
 	}
 
@@ -2255,6 +2259,7 @@ static int auth_socket_recv(rad_listen_t *listener)
 
 		if (DEBUG_ENABLED) ERROR("Receive - Invalid packet code %d sent to authentication port from "
 					 "client %s port %d", code, client->shortname, src_port);
+		listen_drop_log(listener, &src_ipaddr, src_port, client, code, DECODE_FAIL_NONE);
 		return 0;
 	} /* switch over packet types */
 
@@ -2270,10 +2275,13 @@ static int auth_socket_recv(rad_listen_t *listener)
 	 *	Now that we've sanity checked everything, receive the
 	 *	packet.
 	 */
-	packet = rad_recv(ctx, listener->fd, (client->require_ma == FR_BOOL_TRUE) | ((client->limit_proxy_state == FR_BOOL_TRUE) << 2));
+	packet = rad_recv_reason(ctx, listener->fd,
+				 (client->require_ma == FR_BOOL_TRUE) | ((client->limit_proxy_state == FR_BOOL_TRUE) << 2),
+				 &reason);
 	if (!packet) {
 		FR_STATS_INC(auth, total_malformed_requests);
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
+		if (reason != DECODE_FAIL_NONE) listen_drop_log(listener, &src_ipaddr, src_port, client, code, reason);
 		talloc_free(ctx);
 		return 0;
 	}
@@ -2331,6 +2339,7 @@ static int acct_socket_recv(rad_listen_t *listener)
 	RADCLIENT	*client = NULL;
 	fr_ipaddr_t	src_ipaddr;
 	TALLOC_CTX	*ctx;
+	decode_fail_t	reason;
 
 	rcode = rad_recv_header(listener->fd, &src_ipaddr, &src_port, &code);
 	if (rcode < 0) return 0;
@@ -2340,6 +2349,9 @@ static int acct_socket_recv(rad_listen_t *listener)
 	if (rcode < 20) {	/* RADIUS_HDR_LEN */
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
 		FR_STATS_INC(acct, total_malformed_requests);
+		if ((rcode == 1) && (src_ipaddr.af != AF_UNSPEC)) {
+			listen_drop_log(listener, &src_ipaddr, src_port, NULL, 0, DECODE_FAIL_MAX);
+		}
 		return 0;
 	}
 
@@ -2376,6 +2388,7 @@ static int acct_socket_recv(rad_listen_t *listener)
 
 		DEBUG("Invalid packet code %d sent to a accounting port from client %s port %d : IGNORED",
 		      code, client->shortname, src_port);
+		listen_drop_log(listener, &src_ipaddr, src_port, client, code, DECODE_FAIL_NONE);
 		return 0;
 	} /* switch over packet types */
 
@@ -2391,10 +2404,11 @@ static int acct_socket_recv(rad_listen_t *listener)
 	 *	Now that we've sanity checked everything, receive the
 	 *	packet.
 	 */
-	packet = rad_recv(ctx, listener->fd, 0);
+	packet = rad_recv_reason(ctx, listener->fd, 0, &reason);
 	if (!packet) {
 		FR_STATS_INC(acct, total_malformed_requests);
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
+		if (reason != DECODE_FAIL_NONE) listen_drop_log(listener, &src_ipaddr, src_port, client, code, reason);
 		talloc_free(ctx);
 		return 0;
 	}

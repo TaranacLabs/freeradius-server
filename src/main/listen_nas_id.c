@@ -72,34 +72,6 @@ static int nas_id_peek(int fd, uint8_t *buffer, size_t bufsize, uint8_t const **
 	return count;
 }
 
-/*
- *	Daemon mode logs a dropped source at most once a second.  Sources
- *	share 256 slots, so a flood from many addresses still cannot fill
- *	the log faster than 256 lines a second.  Only the thread which
- *	reads the sockets uses it, as with the "unknown client" message.
- */
-static bool nas_id_log_now(fr_ipaddr_t const *ipaddr)
-{
-	static struct {
-		fr_ipaddr_t	ipaddr;
-		time_t		when;
-	} slots[256];
-	uint32_t	hash;
-	time_t		now;
-
-	if (rad_debug_lvl) return true;
-
-	hash = fr_hash(&ipaddr->ipaddr, (ipaddr->af == AF_INET) ? sizeof(ipaddr->ipaddr.ip4addr) :
-		       sizeof(ipaddr->ipaddr.ip6addr)) & 0xff;
-	now = time(NULL);
-
-	if ((slots[hash].when == now) && (fr_ipaddr_cmp(&slots[hash].ipaddr, ipaddr) == 0)) return false;
-
-	slots[hash].ipaddr = *ipaddr;
-	slots[hash].when = now;
-	return true;
-}
-
 /** Find the client of a UDP authentication or accounting packet
  *
  * Wraps client_listener_find(): when there are identify_by clients, the
@@ -136,7 +108,7 @@ RADCLIENT *client_nas_id_listener_find(rad_listen_t *listener, fr_ipaddr_t const
 	parent = client_nas_id_covering(sock->clients, ipaddr);
 	if (!parent) return client_listener_find(listener, ipaddr, src_port);
 
-	if (!nas_id_log_now(ipaddr)) return NULL;
+	if (!listen_drop_log_now(ipaddr)) return NULL;
 
 	listener->print(listener, name, sizeof(name));
 	inet_ntop(ipaddr->af, &ipaddr->ipaddr, src, sizeof(src));

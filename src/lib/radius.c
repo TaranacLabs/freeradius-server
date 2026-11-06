@@ -2949,9 +2949,28 @@ bool rad_packet_ok(RADIUS_PACKET *packet, int flags, decode_fail_t *reason)
  */
 RADIUS_PACKET *rad_recv(TALLOC_CTX *ctx, int fd, int flags)
 {
+	return rad_recv_reason(ctx, fd, flags, NULL);
+}
+
+/** Receive a packet, as rad_recv(), and say why it was refused
+ *
+ * @param[in] ctx	to allocate the packet in.
+ * @param[in] fd	to read from.
+ * @param[in] flags	as for rad_recv().
+ * @param[out] reason	set to why a packet which was read was refused,
+ *			DECODE_FAIL_MIN_LENGTH_MISMATCH for a datagram shorter
+ *			than its Length field, DECODE_FAIL_NONE when the packet
+ *			is OK or nothing was read.
+ *			May be NULL.
+ * @return the packet, or NULL on error.
+ */
+RADIUS_PACKET *rad_recv_reason(TALLOC_CTX *ctx, int fd, int flags, decode_fail_t *reason)
+{
 	int sock_flags = 0;
 	ssize_t data_len;
 	RADIUS_PACKET		*packet;
+
+	if (reason) *reason = DECODE_FAIL_NONE;
 
 	/*
 	 *	Allocate the new request data structure
@@ -2982,9 +3001,11 @@ RADIUS_PACKET *rad_recv(TALLOC_CTX *ctx, int fd, int flags)
 	}
 
 	/*
-	 *	No data read from the network.
+	 *	No data read from the network, or a datagram shorter
+	 *	than its Length field, which rad_recvfrom() discarded.
 	 */
 	if (data_len == 0) {
+		if (reason) *reason = DECODE_FAIL_MIN_LENGTH_MISMATCH;
 		rad_free(&packet);
 		return NULL;
 	}
@@ -2992,7 +3013,7 @@ RADIUS_PACKET *rad_recv(TALLOC_CTX *ctx, int fd, int flags)
 	/*
 	 *	See if it's a well-formed RADIUS packet.
 	 */
-	if (!rad_packet_ok(packet, flags, NULL)) {
+	if (!rad_packet_ok(packet, flags, reason)) {
 		rad_free(&packet);
 		return NULL;
 	}
