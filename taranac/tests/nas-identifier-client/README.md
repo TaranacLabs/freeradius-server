@@ -10,7 +10,7 @@ Tests for the fork's clients selected by NAS-Identifier (`identify_by = nas_iden
 Build and install the branch (`make install`), then, as root with `CAP_NET_ADMIN`, anywhere with
 `radiusd`, `radclient`, `bash` and `ip` (iproute2 or busybox):
 
-    ./run.sh <workdir> [check errors main ratelimit stock]
+    ./run.sh <workdir> [check errors main ratelimit drops stock]
 
 The harness adds the source addresses it sends from (`10.77.0.1`, `10.77.0.5`, `10.77.0.9`,
 `10.66.0.1`, `10.66.0.2`, `10.55.0.1`, `10.88.0.1`, `fd00:77::1`) to `lo`: a packet sent to a
@@ -48,6 +48,17 @@ secret of its own, and ignores `identify_by` and the entries otherwise).
   Authenticator, no Message-Authenticator needed).
 - `ratelimit` — 20 dropped packets from one source in daemon mode give one log line (two if the
   burst crosses a second); a second source gets its own line.
+- `drops` — daemon mode (`-f`): packets from a known client which radiusd used to drop with a
+  message only in debug mode now log an `Ignoring request ...` line (`src/main/listen_drop.c`):
+  no Message-Authenticator where the client (`require_message_authenticator = yes`) or a
+  NAS-Identifier entry requires it, Proxy-State without Message-Authenticator under
+  `limit_proxy_state`, Status-Server without Message-Authenticator, a packet code the port does
+  not accept (radclient, and a raw code 99), malformed packets sent raw with bash's `/dev/udp`
+  (short attribute, attribute 0, attribute header overflow, datagram shorter than its Length
+  field, Length < 20, 3-byte datagram, IPv6, a source only an identify_by client covers). A bad
+  header from an address no client covers logs nothing. 20 drops from one source give one line
+  (two if the burst crosses a second), and the User-Name is in no line. The probes are a second
+  apart because of the per-source limit.
 - `stock` — without identify_by clients the receive path is upstream's: address clients answer,
   unknown sources are dropped with the upstream message. These rows pass on a binary without the
   feature too; they guard against regressions, they are not evidence that the patch works.
