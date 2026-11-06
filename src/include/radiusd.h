@@ -607,6 +607,11 @@ RADCLIENT *client_listener_find(rad_listen_t *listener, fr_ipaddr_t const *ipadd
 /* listen_nas_id.c */
 RADCLIENT *client_nas_id_listener_find(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port);
 
+/* listen_drop.c */
+bool listen_drop_log_now(fr_ipaddr_t const *ipaddr);
+void listen_drop_log(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port,
+		     RADCLIENT const *client, int code, decode_fail_t reason);
+
 #ifdef WITH_STATS
 RADCLIENT_LIST *listener_find_client_list(fr_ipaddr_t const *ipaddr, uint16_t port, int proto);
 #endif
