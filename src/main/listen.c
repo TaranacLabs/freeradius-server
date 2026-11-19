@@ -2442,6 +2442,7 @@ static int auth_socket_recv(rad_listen_t *listener)
 	RAD_REQUEST_FUNP fun = NULL;
 	RADCLIENT	*client = NULL;
 	fr_ipaddr_t	src_ipaddr;
+	RADIUS_PACKET	*refused;
 	TALLOC_CTX	*ctx;
 	decode_fail_t	reason;
 
@@ -2454,7 +2455,7 @@ static int auth_socket_recv(rad_listen_t *listener)
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
 		FR_STATS_INC(auth, total_malformed_requests);
 		if ((rcode == 1) && (src_ipaddr.af != AF_UNSPEC)) {
-			listen_drop_log(listener, &src_ipaddr, src_port, NULL, 0, DECODE_FAIL_MAX);
+			listen_drop_log(listener, &src_ipaddr, src_port, NULL, 0, DECODE_FAIL_MAX, NULL);
 		}
 		return 0;
 	}
@@ -2486,13 +2487,17 @@ static int auth_socket_recv(rad_listen_t *listener)
 		break;
 
 	default:
-		rad_recv_discard(listener->fd);
 		FR_STATS_INC(auth, total_unknown_types);
 
 		if (DEBUG_ENABLED) ERROR("Receive - Invalid packet code %d sent to authentication port from "
 					 "client %s port %d", code, client->shortname, src_port);
-		listen_drop_log(listener, &src_ipaddr, src_port, client, code, DECODE_FAIL_NONE);
-		return 0;
+		listen_drop_log(listener, &src_ipaddr, src_port, client, code, DECODE_FAIL_NONE, NULL);
+
+		/*
+		 *	Reads the packet for "refused_virtual_server", or
+		 *	discards it.
+		 */
+		return listen_refused_wrong_port(listener, client);
 	} /* switch over packet types */
 
 	ctx = talloc_pool(NULL, main_config.talloc_pool_size);
@@ -2510,11 +2515,17 @@ static int auth_socket_recv(rad_listen_t *listener)
 	packet = rad_recv_reason(ctx, listener->fd,
 				 ((client->require_ma == FR_BOOL_TRUE) ? RAD_RECV_FLAG_REQUIRE_MA : 0) |
 				 ((client->limit_proxy_state == FR_BOOL_TRUE) ? RAD_RECV_FLAG_LIMIT_PROXY_STATE : 0),
-				 &reason);
+				 &reason, &refused);
 	if (!packet) {
 		FR_STATS_INC(auth, total_malformed_requests);
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
-		if (reason != DECODE_FAIL_NONE) listen_drop_log(listener, &src_ipaddr, src_port, client, code, reason);
+		if (reason != DECODE_FAIL_NONE) listen_drop_log(listener, &src_ipaddr, src_port, client, code, reason,
+								refused);
+
+		/*
+		 *	Run through "refused_virtual_server", or freed.
+		 */
+		if (refused) return listen_refused_packet(ctx, listener, refused, client, reason);
 		talloc_free(ctx);
 		return 0;
 	}
@@ -2571,6 +2582,7 @@ static int acct_socket_recv(rad_listen_t *listener)
 	RAD_REQUEST_FUNP fun = NULL;
 	RADCLIENT	*client = NULL;
 	fr_ipaddr_t	src_ipaddr;
+	RADIUS_PACKET	*refused;
 	TALLOC_CTX	*ctx;
 	decode_fail_t	reason;
 
@@ -2583,7 +2595,7 @@ static int acct_socket_recv(rad_listen_t *listener)
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
 		FR_STATS_INC(acct, total_malformed_requests);
 		if ((rcode == 1) && (src_ipaddr.af != AF_UNSPEC)) {
-			listen_drop_log(listener, &src_ipaddr, src_port, NULL, 0, DECODE_FAIL_MAX);
+			listen_drop_log(listener, &src_ipaddr, src_port, NULL, 0, DECODE_FAIL_MAX, NULL);
 		}
 		return 0;
 	}
@@ -2616,13 +2628,17 @@ static int acct_socket_recv(rad_listen_t *listener)
 		break;
 
 	default:
-		rad_recv_discard(listener->fd);
 		FR_STATS_INC(acct, total_unknown_types);
 
 		DEBUG("Invalid packet code %d sent to a accounting port from client %s port %d : IGNORED",
 		      code, client->shortname, src_port);
-		listen_drop_log(listener, &src_ipaddr, src_port, client, code, DECODE_FAIL_NONE);
-		return 0;
+		listen_drop_log(listener, &src_ipaddr, src_port, client, code, DECODE_FAIL_NONE, NULL);
+
+		/*
+		 *	Reads the packet for "refused_virtual_server", or
+		 *	discards it.
+		 */
+		return listen_refused_wrong_port(listener, client);
 	} /* switch over packet types */
 
 	ctx = talloc_pool(NULL, main_config.talloc_pool_size);
@@ -2637,11 +2653,17 @@ static int acct_socket_recv(rad_listen_t *listener)
 	 *	Now that we've sanity checked everything, receive the
 	 *	packet.
 	 */
-	packet = rad_recv_reason(ctx, listener->fd, RAD_RECV_FLAG_NONE, &reason);
+	packet = rad_recv_reason(ctx, listener->fd, RAD_RECV_FLAG_NONE, &reason, &refused);
 	if (!packet) {
 		FR_STATS_INC(acct, total_malformed_requests);
 		if (DEBUG_ENABLED) ERROR("Receive - %s", fr_strerror());
-		if (reason != DECODE_FAIL_NONE) listen_drop_log(listener, &src_ipaddr, src_port, client, code, reason);
+		if (reason != DECODE_FAIL_NONE) listen_drop_log(listener, &src_ipaddr, src_port, client, code, reason,
+								refused);
+
+		/*
+		 *	Run through "refused_virtual_server", or freed.
+		 */
+		if (refused) return listen_refused_packet(ctx, listener, refused, client, reason);
 		talloc_free(ctx);
 		return 0;
 	}

@@ -610,7 +610,7 @@ RADCLIENT *client_nas_id_listener_find(rad_listen_t *listener, fr_ipaddr_t const
 /* listen_drop.c */
 bool listen_drop_log_now(fr_ipaddr_t const *ipaddr);
 void listen_drop_log(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port,
-		     RADCLIENT const *client, int code, decode_fail_t reason);
+		     RADCLIENT const *client, int code, decode_fail_t reason, RADIUS_PACKET const *packet);
 
 /*
  *	Why a request was refused before any module ran: the values of
@@ -624,6 +624,10 @@ typedef enum refused_reason_t {
 } refused_reason_t;
 
 void listen_refused_request(REQUEST *request, refused_reason_t reason, char const *message);
+int listen_refused_packet(TALLOC_CTX *ctx, rad_listen_t *listener, RADIUS_PACKET *packet, RADCLIENT *client,
+			  decode_fail_t reason);
+int listen_refused_wrong_port(rad_listen_t *listener, RADCLIENT *client);
+int rad_refused(REQUEST *request);
 
 #ifdef WITH_STATS
 RADCLIENT_LIST *listener_find_client_list(fr_ipaddr_t const *ipaddr, uint16_t port, int proto);
