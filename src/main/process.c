@@ -1492,6 +1492,17 @@ static int request_pre_handler(REQUEST *request, UNUSED int action)
 	if (request->master_state == REQUEST_STOP_PROCESSING) return 0;
 
 	/*
+	 *	A packet which the receive path refused from a known
+	 *	client, see listen_refused_packet().  It is run through
+	 *	"refused_virtual_server" here, in a worker thread, then
+	 *	dropped without a response.
+	 */
+	if (request->handle == rad_refused) {
+		(void) rad_refused(request);
+		return 0;
+	}
+
+	/*
 	 *	Don't decode the packet if it's an internal "fake"
 	 *	request.  Instead, just return so that the caller can
 	 *	process it.

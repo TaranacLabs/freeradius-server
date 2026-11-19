@@ -2949,7 +2949,7 @@ bool rad_packet_ok(RADIUS_PACKET *packet, int flags, decode_fail_t *reason)
  */
 RADIUS_PACKET *rad_recv(TALLOC_CTX *ctx, int fd, int flags)
 {
-	return rad_recv_reason(ctx, fd, flags, NULL);
+	return rad_recv_reason(ctx, fd, flags, NULL, NULL);
 }
 
 /** Receive a packet, as rad_recv(), and say why it was refused
@@ -2962,15 +2962,27 @@ RADIUS_PACKET *rad_recv(TALLOC_CTX *ctx, int fd, int flags)
  *			than its Length field, DECODE_FAIL_NONE when the packet
  *			is OK or nothing was read.
  *			May be NULL.
+ * @param[out] refused	set to the packet which was read and refused,
+ *			NULL otherwise.  Its code, ID and authenticator
+ *			are those of the header, it has no attributes,
+ *			and it is allocated in ctx.  Only when *reason
+ *			is DECODE_FAIL_MA_MISSING are its attributes
+ *			well-formed (rad_packet_ok() checks them before
+ *			the Message-Authenticator), so that rad_decode()
+ *			may read them.
+ *			May be NULL: the refused packet is then freed.
  * @return the packet, or NULL on error.
  */
-RADIUS_PACKET *rad_recv_reason(TALLOC_CTX *ctx, int fd, int flags, decode_fail_t *reason)
+RADIUS_PACKET *rad_recv_reason(TALLOC_CTX *ctx, int fd, int flags, decode_fail_t *reason,
+			       RADIUS_PACKET **refused)
 {
 	int sock_flags = 0;
 	ssize_t data_len;
 	RADIUS_PACKET		*packet;
+	radius_packet_t		*hdr;
 
 	if (reason) *reason = DECODE_FAIL_NONE;
+	if (refused) *refused = NULL;
 
 	/*
 	 *	Allocate the new request data structure
@@ -3014,7 +3026,23 @@ RADIUS_PACKET *rad_recv_reason(TALLOC_CTX *ctx, int fd, int flags, decode_fail_t
 	 *	See if it's a well-formed RADIUS packet.
 	 */
 	if (!rad_packet_ok(packet, flags, reason)) {
-		rad_free(&packet);
+		if (!refused || (packet->data_len < RADIUS_HDR_LEN)) {
+			rad_free(&packet);
+			return NULL;
+		}
+
+		/*
+		 *	rad_packet_ok() fills these only for a packet
+		 *	which it accepts.
+		 */
+		hdr = (radius_packet_t *) packet->data;
+		packet->code = hdr->code;
+		packet->id = hdr->id;
+		memcpy(packet->vector, hdr->vector, AUTH_VECTOR_LEN);
+		packet->sockfd = fd;
+		packet->vps = NULL;
+
+		*refused = packet;
 		return NULL;
 	}
 

@@ -153,26 +153,36 @@ listen {
 #	clients = per_socket_clients
 
 	#
-	#  A request from a known client which fails its signature
-	#  check (an invalid Message-Authenticator, or an invalid
-	#  Accounting-Request authenticator: the client's shared
-	#  secret is not ours), or which does not decode, is dropped
-	#  without a reply, and only a rate limited line in the log
-	#  says so.
+	#  A request from a known client which this socket refuses is
+	#  dropped without a reply, and only a rate limited line in
+	#  the log says so:
+	#
+	#    - its signature does not verify (an invalid
+	#      Message-Authenticator, or an invalid Accounting-Request
+	#      authenticator: the client's shared secret is not ours);
+	#    - it lacks a Message-Authenticator which the client
+	#      requires, or which Status-Server, EAP-Message, or
+	#      Proxy-State with "limit_proxy_state" requires;
+	#    - its packet code is not one this socket accepts (e.g. an
+	#      Accounting-Request sent to the "auth" port);
+	#    - it does not decode, or its attributes are malformed.
 	#
 	#  With "refused_virtual_server", such a request is first run
 	#  through the "authorize" section of the named virtual
 	#  server, so that it can be logged or counted per request.
 	#  The request carries:
 	#
-	#    Refused-Reason          Key-Mismatch or Malformed-Request
+	#    Refused-Reason          Key-Mismatch,
+	#                            Message-Authenticator-Missing,
+	#                            Wrong-Port or Malformed-Request
 	#    Module-Failure-Message  the server's own error text
 	#
-	#  and, for Key-Mismatch, the attributes as the client sent
-	#  them, NOT verified, without those which depend on the
-	#  secret (User-Password, Tunnel-Password, the MS-MPPE keys,
-	#  Message-Authenticator...).  A Malformed-Request has no
-	#  other attributes.
+	#  and, except for Malformed-Request, the attributes as the
+	#  client sent them, NOT verified, without those which depend
+	#  on the secret (User-Password, Tunnel-Password, the MS-MPPE
+	#  keys, Message-Authenticator...).  A Malformed-Request has no
+	#  other attributes.  A datagram with an invalid RADIUS header
+	#  is not a request, and is only logged.
 	#
 	#  The request is still dropped without a reply, whatever the
 	#  virtual server does.  It is never proxied, and a CoA
@@ -180,8 +190,10 @@ listen {
 	#  a new request.
 	#
 	#  Only UDP sockets of type "auth" or "acct" take this
-	#  option.  The virtual server runs once for each refused
-	#  packet: keep it cheap.
+	#  option.  The virtual server runs in the worker threads,
+	#  once for each refused packet, subject to "max_requests",
+	#  "max_pps" and the thread pool's queue like any other
+	#  request: keep it cheap.
 	#
 #	refused_virtual_server = refused
 
