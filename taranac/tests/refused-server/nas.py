@@ -56,6 +56,11 @@ def build(args, ident, vector):
         attrs += attr(3, b"\x01" + b"C" * 16)
     if args.nas_id is not None:
         attrs += attr(32, args.nas_id.encode())
+    if args.proxy_state:
+        attrs += attr(33, b"\x01")
+    if args.eap:
+        # EAP-Message: Response/Identity "x"
+        attrs += attr(79, b"\x02\x01\x00\x06\x01x")
     if args.code == "acct":
         attrs += attr(40, struct.pack("!I", 1))  # Acct-Status-Type = Start
         attrs += attr(44, b"session-1")          # Acct-Session-Id
@@ -69,7 +74,7 @@ def build(args, ident, vector):
         # Cisco-AVPair (Cisco 1) times n, all inside ONE Vendor-Specific
         attrs += vsa(9, [(1, b"a=%d" % i) for i in range(args.vsa_count)])
 
-    code = CODES[args.code]
+    code = CODES[args.code] if args.code in CODES else int(args.code)
     ma = args.ma if args.ma is not None else code != ACCOUNTING_REQUEST
     if ma:
         attrs += attr(80, b"\x00" * 16)
@@ -92,7 +97,7 @@ def main():
     ap.add_argument("host")
     ap.add_argument("port", type=int)
     ap.add_argument("secret")
-    ap.add_argument("--code", choices=sorted(CODES), default="auth")
+    ap.add_argument("--code", default="auth", help="auth, acct, status or a number")
     ap.add_argument("--user")
     ap.add_argument("--password")
     ap.add_argument("--nas-id")
@@ -100,6 +105,10 @@ def main():
     ap.add_argument("--tunnel-password", action="store_true")
     ap.add_argument("--mppe", action="store_true")
     ap.add_argument("--vsa-count", type=int, default=0)
+    ap.add_argument("--proxy-state", action="store_true")
+    ap.add_argument("--eap", action="store_true", help="add an EAP-Message")
+    ap.add_argument("--src", help="source address (any 127.0.0.0/8 address is local)")
+    ap.add_argument("--raw", help="send these octets (hex) instead of a request built from the options")
     ap.add_argument("--ma", dest="ma", action="store_true", default=None,
                     help="add Message-Authenticator (default: yes, but not for acct)")
     ap.add_argument("--no-ma", dest="ma", action="store_false")
@@ -110,8 +119,13 @@ def main():
 
     fam = socket.AF_INET6 if ":" in args.host else socket.AF_INET
     s = socket.socket(fam, socket.SOCK_DGRAM)
+    if args.src:
+        s.bind((args.src, 0))
     s.connect((args.host, args.port))
-    pkt = build(args, os.getpid() & 0xff, os.urandom(16))
+    if args.raw:
+        pkt = bytes.fromhex(args.raw)
+    else:
+        pkt = build(args, os.getpid() & 0xff, os.urandom(16))
 
     replies, first = 0, None
 
