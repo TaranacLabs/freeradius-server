@@ -25,10 +25,14 @@
  * lacks a Message-Authenticator the client requires, used to be
  * dropped without a trace.  These functions log one line per drop,
  * rate limited per source address.
+ *
+ * A listener with "refused_virtual_server" also runs each request it
+ * refuses through that virtual server, see listen_refused_request().
  */
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
+#include <freeradius-devel/modules.h>
 
 #include <ctype.h>
 
@@ -162,4 +166,98 @@ void listen_drop_log(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t
 		       name, src, src_port, decode_fail_str(reason), client->shortname);
 		break;
 	}
+}
+
+/** Whether an attribute's value depends on the shared secret
+ *
+ * User-Password, Tunnel-Password, the MS-MPPE keys and the like are
+ * encrypted with the secret, and Message-Authenticator is signed
+ * with it.  An attribute which did not decrypt is left unknown, so
+ * its number is looked up again.
+ */
+static bool refused_secret_dependent(DICT_ATTR const *da)
+{
+	if (da->flags.is_unknown) {
+		DICT_ATTR const *known = dict_attrbyvalue(da->attr, da->vendor);
+
+		if (known) da = known;
+	}
+
+	if (!da->vendor && (da->attr == PW_MESSAGE_AUTHENTICATOR)) return true;
+
+	return (da->flags.encrypt != FLAG_ENCRYPT_NONE);
+}
+
+/** Run a refused request through the listener's "refused_virtual_server"
+ *
+ * The request is not answered whatever the virtual server does: the
+ * caller drops it as before.  It is not proxied either (only the
+ * authorize section runs), and a CoA request it originates is
+ * freed here, before request_done() could send it.
+ *
+ * @param request	which the listener refused.  Its packet has no
+ *			attributes yet.
+ * @param reason	why, the value of Refused-Reason.
+ * @param message	the server's own words, Module-Failure-Message.
+ */
+void listen_refused_request(REQUEST *request, refused_reason_t reason, char const *message)
+{
+	listen_socket_t	*sock;
+	VALUE_PAIR	*vp, **last;
+
+	/*
+	 *	Only UDP auth and acct sockets take the option, and only
+	 *	theirs is a listen_socket_t.
+	 */
+	if (!request->listener ||
+	    ((request->listener->type != RAD_LISTEN_AUTH) && (request->listener->type != RAD_LISTEN_ACCT))) return;
+
+	sock = request->listener->data;
+	if (!sock->refused_server) return;
+
+	if (reason == REFUSED_REASON_KEY_MISMATCH) {
+		/*
+		 *	Decode what we can without trusting it.  rad_verify()
+		 *	left the Message-Authenticator, and for an
+		 *	Accounting-Request the Request Authenticator, zeroed
+		 *	in packet->data.  rad_decode() takes the
+		 *	authenticator from packet->vector, which is intact,
+		 *	and the Message-Authenticator is removed below.  If
+		 *	decoding fails, the packet has no attributes.
+		 */
+		(void) rad_decode(request->packet, NULL, request->client->secret);
+
+		/*
+		 *	Values encrypted with the wrong secret are noise.
+		 *	Everything else is as the client sent it.
+		 */
+		for (last = &request->packet->vps; (vp = *last) != NULL; ) {
+			if (refused_secret_dependent(vp->da)) {
+				*last = vp->next;
+				vp->next = NULL;
+				talloc_free(vp);
+				continue;
+			}
+			last = &vp->next;
+		}
+	}
+
+	vp = radius_pair_create(request->packet, &request->packet->vps, PW_REFUSED_REASON, 0);
+	vp->vp_integer = reason;
+
+	vp = radius_pair_create(request->packet, &request->packet->vps, PW_MODULE_FAILURE_MESSAGE, 0);
+	fr_pair_value_strcpy(vp, message);
+
+	request->username = fr_pair_find_by_num(request->packet->vps, PW_USER_NAME, 0, TAG_ANY);
+	request->server = sock->refused_server;
+
+	RDEBUG("Refused request, running it through server %s", request->server);
+	rdebug_pair_list(L_DBG_LVL_1, request, request->packet->vps, NULL);
+	RDEBUG("server %s {", request->server);
+	(void) process_authorize(0, request);
+	RDEBUG("} # server %s", request->server);
+
+#ifdef WITH_COA
+	TALLOC_FREE(request->coa);
+#endif
 }

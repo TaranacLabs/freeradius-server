@@ -679,8 +679,21 @@ ATTRIBUTE	SoH-MS-Health-Other			2129	string
 ATTRIBUTE	Radclient-Test-Name			2200	string
 
 #
-#	Range:	2220-2999
+#	Range:	2220-2899
 #		Free
+#
+#	Range:	2900-2999
+#		Requests refused before any module ran (see
+#		"refused_virtual_server" in raddb/sites-available/default)
+#
+ATTRIBUTE	Refused-Reason				2900	integer
+
+#	The values must match refused_reason_t in src/include/radiusd.h
+VALUE	Refused-Reason			Key-Mismatch		1
+VALUE	Refused-Reason			Malformed-Request	2
+VALUE	Refused-Reason			Wrong-Port		3
+VALUE	Refused-Reason			Message-Authenticator-Missing 4
+
 #
 #	Range:	3000-3999
 #		Site-local attributes (see raddb/dictionary)

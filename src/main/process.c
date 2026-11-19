@@ -1558,7 +1558,22 @@ static int request_pre_handler(REQUEST *request, UNUSED int action)
 
 	rcode = request->listener->decode(request->listener, request);
 	if (rcode < 0) {
-		RATE_LIMIT(INFO("Dropping packet without response because of error: %s (from client %s)", fr_strerror(), request->client->shortname));
+		char error[256];
+
+		/*
+		 *	Reading fr_strerror() clears it, and it is used twice.
+		 */
+		strlcpy(error, fr_strerror(), sizeof(error));
+
+		RATE_LIMIT(INFO("Dropping packet without response because of error: %s (from client %s)", error, request->client->shortname));
+
+		/*
+		 *	The request is still dropped without a response
+		 *	whatever this does: we return 0 below.
+		 */
+		listen_refused_request(request, (rcode == -2) ? REFUSED_REASON_KEY_MISMATCH :
+				       REFUSED_REASON_MALFORMED_REQUEST, error);
+
 		request->reply->offset = -2; /* bad authenticator */
 		return 0;
 	}

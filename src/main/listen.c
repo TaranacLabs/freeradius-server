@@ -2091,6 +2091,34 @@ int common_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 	sock->my_ipaddr = ipaddr;
 	sock->my_port = listen_port;
 
+	/*
+	 *	A request from a known client which this socket refuses
+	 *	is run through this virtual server, then dropped
+	 *	without a reply.  See listen_refused_request().
+	 *	Checked before the "radiusd -C" return below.
+	 */
+	rcode = cf_item_parse(cs, "refused_virtual_server",
+			      FR_ITEM_POINTER(PW_TYPE_STRING, &sock->refused_server), NULL);
+	if (rcode < 0) return -1;
+	if (sock->refused_server) {
+		if (((this->type != RAD_LISTEN_AUTH) && (this->type != RAD_LISTEN_ACCT)) ||
+		    (sock->proto != IPPROTO_UDP)
+#ifdef WITH_TLS
+		    || this->tls
+#endif
+			) {
+			cf_log_err_cs(cs, "\"refused_virtual_server\" is allowed only in a UDP "
+				      "listen section of type \"auth\" or \"acct\"");
+			return -1;
+		}
+
+		if (!cf_section_sub_find_name2(cf_top_section(cs), "server", sock->refused_server)) {
+			cf_log_err_cs(cs, "No such server \"%s\" for \"refused_virtual_server\"",
+				      sock->refused_server);
+			return -1;
+		}
+	}
+
 #ifdef WITH_PROXY
 	if (check_config) {
 		/*
@@ -3232,9 +3260,14 @@ static int client_socket_decode(UNUSED rad_listen_t *listener, REQUEST *request)
 #endif
 #endif
 
+	/*
+	 *	-2: the signature does not verify (on a UDP auth or acct
+	 *	socket the code was already checked, so rad_verify() fails
+	 *	for nothing else).  -1: the packet does not decode.
+	 */
 	if (rad_verify(request->packet, NULL,
 		       request->client->secret) < 0) {
-		return -1;
+		return -2;
 	}
 
 #ifdef WITH_TLS
