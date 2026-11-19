@@ -210,6 +210,8 @@ typedef struct listen_socket_t {
 #endif
 
 	RADCLIENT_LIST	*clients;
+
+	char const	*refused_server;	//!< "refused_virtual_server": UDP auth and acct only
 } listen_socket_t;
 #endif /* LISTEN_H */
 

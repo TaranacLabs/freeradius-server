@@ -607,6 +607,19 @@ bool listen_drop_log_now(fr_ipaddr_t const *ipaddr);
 void listen_drop_log(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port,
 		     RADCLIENT const *client, int code, decode_fail_t reason);
 
+/*
+ *	Why a request was refused before any module ran: the values of
+ *	Refused-Reason in share/dictionary.freeradius.internal.
+ */
+typedef enum refused_reason_t {
+	REFUSED_REASON_KEY_MISMATCH = 1,		//!< the signature does not verify
+	REFUSED_REASON_MALFORMED_REQUEST = 2,		//!< the packet does not decode
+	REFUSED_REASON_WRONG_PORT = 3,			//!< the socket does not accept the code
+	REFUSED_REASON_MESSAGE_AUTHENTICATOR_MISSING = 4	//!< a required Message-Authenticator is absent
+} refused_reason_t;
+
+void listen_refused_request(REQUEST *request, refused_reason_t reason, char const *message);
+
 #ifdef WITH_STATS
 RADCLIENT_LIST *listener_find_client_list(fr_ipaddr_t const *ipaddr, uint16_t port, int proto);
 #endif

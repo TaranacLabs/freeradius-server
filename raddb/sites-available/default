@@ -153,6 +153,39 @@ listen {
 #	clients = per_socket_clients
 
 	#
+	#  A request from a known client which fails its signature
+	#  check (an invalid Message-Authenticator, or an invalid
+	#  Accounting-Request authenticator: the client's shared
+	#  secret is not ours), or which does not decode, is dropped
+	#  without a reply, and only a rate limited line in the log
+	#  says so.
+	#
+	#  With "refused_virtual_server", such a request is first run
+	#  through the "authorize" section of the named virtual
+	#  server, so that it can be logged or counted per request.
+	#  The request carries:
+	#
+	#    Refused-Reason          Key-Mismatch or Malformed-Request
+	#    Module-Failure-Message  the server's own error text
+	#
+	#  and, for Key-Mismatch, the attributes as the client sent
+	#  them, NOT verified, without those which depend on the
+	#  secret (User-Password, Tunnel-Password, the MS-MPPE keys,
+	#  Message-Authenticator...).  A Malformed-Request has no
+	#  other attributes.
+	#
+	#  The request is still dropped without a reply, whatever the
+	#  virtual server does.  It is never proxied, and a CoA
+	#  request it originates is not sent.  Each retransmission is
+	#  a new request.
+	#
+	#  Only UDP sockets of type "auth" or "acct" take this
+	#  option.  The virtual server runs once for each refused
+	#  packet: keep it cheap.
+	#
+#	refused_virtual_server = refused
+
+	#
 	#  Set the default UDP receive buffer size.  In most cases,
 	#  the default values set by the kernel are fine.  However, in
 	#  some cases the NASes will send large packets, and many of
