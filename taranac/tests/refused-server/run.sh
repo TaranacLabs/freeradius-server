@@ -3,7 +3,7 @@
 # which do not, probed on 127.0.0.1 and ::1 by radclient and by nas.py (a minimal client which
 # counts every datagram that comes back, verified or not).
 #
-#   run.sh <workdir> [scenario ...]        default: all (dictionary check errors signature malformed)
+#   run.sh <workdir> [scenario ...]        default: all (dictionary check errors signature malformed receive)
 #
 # Needs in PATH (or RADIUSD=/path, RADCLIENT=/path): radiusd and radclient built from the ref
 # under test, python3, bash, ip.  No extra addresses and no capabilities, but ::1 must exist:
@@ -26,7 +26,7 @@ RADIUSD=${RADIUSD:-radiusd}
 RADCLIENT=${RADCLIENT:-radclient}
 DICTDIR=${DICTDIR:-/usr/share/freeradius}
 LIBDIR=${LIBDIR:-/usr/lib/freeradius}
-SCEN=${*:-dictionary check errors signature malformed}
+SCEN=${*:-dictionary check errors signature malformed receive}
 
 RESULTS=$W/results.tsv
 printf 'scenario\tcase\texpected\tactual\tverdict\n' >"$RESULTS"
@@ -65,6 +65,7 @@ libdir = $LIBDIR
 pidfile = $d/run/radiusd.pid
 max_request_time = 5
 cleanup_delay = 0
+max_requests = ${MAXREQ:-256}
 hostname_lookups = no
 proxy_requests = yes
 security {
@@ -79,10 +80,10 @@ log {
 	file = $d/radiusd.log
 }
 thread pool {
-	start_servers = 2
-	max_servers = 4
+	start_servers = ${THREADS:-2}
+	max_servers = ${THREADS:-4}
 	min_spare_servers = 1
-	max_spare_servers = 4
+	max_spare_servers = ${THREADS:-4}
 }
 client lo4 {
 	ipaddr = 127.0.0.1
@@ -93,9 +94,10 @@ client lo4 {
 client lo6 {
 	ipv6addr = ::1
 	secret = right
-	require_message_authenticator = no
+	require_message_authenticator = ${LO6_MA:-no}
 	limit_proxy_state = no
 }
+${EXTRA_CLIENTS:-}
 
 # The sinks (sink.py) never answer: they only show whether radiusd sent anything.
 home_server sink_auth {
@@ -245,12 +247,12 @@ CONF
 
 PID=
 SINK=
-start() {	# <dir>
-	local d=$1 i
+start() {	# <dir> [radiusd flags, default -fxx]
+	local d=$1 flags=${2:--fxx} i
 	: >"$d/radiusd.log"
 	python3 "$H/sink.py" "$d/sink.log" 1912 3799 &
 	SINK=$!
-	"$RADIUSD" -fxx -d "$d" -D "$DICTDIR" -l "$d/radiusd.log" >"$d/stdout.log" 2>&1 &
+	"$RADIUSD" $flags -d "$d" -D "$DICTDIR" -l "$d/radiusd.log" >"$d/stdout.log" 2>&1 &
 	PID=$!
 	for i in $(seq 1 100); do
 		grep -q 'Ready to process requests' "$d/radiusd.log" "$d/stdout.log" 2>/dev/null && return 0
@@ -547,6 +549,246 @@ scenario_malformed() {
 	out=$(nas 127.0.0.1 1823 right --code acct --nas-id m_off --vsa-count 3)
 	sleep 0.3
 	expect $s "no option: too many attributes" "replies=0, 0 lines" "$out, $(($(wc -l <"$d/refused.log") - n)) lines"
+	stop
+}
+
+# Clients of the "receive" scenario: their packets are refused by the receive path.  Every
+# 127.0.0.0/8 address is local, so nas.py --src needs no capability.
+CLIENTS_RECEIVE='
+client ma5 {
+	ipaddr = 127.0.0.5
+	secret = ma5-secret
+	require_message_authenticator = yes
+}
+client lps9 {
+	ipaddr = 127.0.0.9
+	secret = lps9-secret
+	require_message_authenticator = no
+	limit_proxy_state = yes
+}
+client site66 {
+	ipaddr = 127.0.66.0/24
+	identify_by = nas_identifier
+	nas_identifier "x" {
+		secret = "secret-x-66"
+		shortname = "sx"
+	}
+}
+'
+
+Z16='00000000000000000000000000000000'
+BURST=${BURST:-500}
+BURST_BOUND_MS=${BURST_BOUND_MS:-250}
+
+# rcase <scenario> <dir> <case> <reason|none> <packet type|*> <user> <message regex|-> <source>
+#       <nas.py arguments...>
+# One probe, one second after the previous one (the daemon logs a source at most once a
+# second).  With a reason: no reply, one run of the refused server with that Refused-Reason,
+# Packet-Type, User-Name, source, without secret-dependent attributes, and a
+# Module-Failure-Message matching the regex which is also, word for word, the daemon's
+# "Ignoring request" line.  With "none": no reply, no run, and the daemon's line matches the
+# regex ("-": there is no "Ignoring request" line).
+rcase() {
+	local s=$1 d=$2 c=$3 reason=$4 type=$5 user=$6 msg=$7 src=$8 n m out new logl mfm pairs exp got
+	shift 8
+	sleep 1.1
+	n=$(wc -l <"$d/refused.log")
+	m=$(wc -l <"$d/radiusd.log")
+	out=$(nas "$@")
+	sleep 0.3
+	new=$(tail -n +"$((n + 1))" "$d/refused.log")
+	logl=$(tail -n +"$((m + 1))" "$d/radiusd.log" | grep 'Ignoring request' | head -1)
+	if [ "$reason" = none ]; then
+		exp="replies=0, 0 lines"
+		got="$out, $(printf '%s' "$new" | grep -c .) lines"
+		if [ "$msg" = - ]; then
+			exp="$exp, no log line"
+			if [ -n "$logl" ]; then got="$got, log line: $logl"; else got="$got, no log line"; fi
+		else
+			exp="$exp, log line"
+			if printf '%s\n' "$logl" | grep -Eq "$msg"; then got="$got, log line"; else got="$got, log lacks it: $logl"; fi
+		fi
+		expect "$s" "$c" "$exp" "$got"
+		return
+	fi
+	[ "$type" = '*' ] && type=$(printf '%s\n' "$new" | head -1 | cut -d'|' -f3)
+	exp="replies=0, 1 line|$reason|$type|$user|message|$src|no secret-dependent attributes|log line = message"
+	got="$out, $(printf '%s' "$new" | grep -c .) line|$(printf '%s\n' "$new" | head -1 | cut -d'|' -f2-4)"
+	mfm=$(printf '%s\n' "$new" | head -1 | cut -d'|' -f5)
+	if printf '%s\n' "$mfm" | grep -Eq "$msg"; then got="$got|message"; else got="$got|message: $mfm"; fi
+	got="$got|$(printf '%s\n' "$new" | head -1 | cut -d'|' -f6)"
+	# the message and the reason name Message-Authenticator: look at the other attributes
+	pairs=$(printf '%s\n' "$new" | head -1 | cut -d'|' -f8 |
+		sed 's/Module-Failure-Message = "[^"]*"//; s/Refused-Reason = [A-Za-z-]*//')
+	if printf '%s\n' "$pairs" | grep -Eq "$SECRET_ATTRS"; then
+		got="$got|secret-dependent attributes: $pairs"
+	else
+		got="$got|no secret-dependent attributes"
+	fi
+	if [ -n "$mfm" ] && [ "${logl%"$mfm"}" != "$logl" ]; then
+		got="$got|log line = message"
+	else
+		got="$got|log line: ${logl:-none}"
+	fi
+	expect "$s" "$c" "$exp" "$got"
+}
+
+scenario_receive() {
+	local s=receive d=$W/receive v6=1 out n m t refused errors lines b
+	local MA4='127.0.0.1 1812'
+	if ! ip -6 addr show dev lo 2>/dev/null | grep -q '::1/128'; then
+		v6=0
+		record $s "IPv6 ::1 on lo" "present" "absent (--sysctl net.ipv6.conf.all.disable_ipv6=0)" FAIL
+	fi
+	EXTRA_CLIENTS=$CLIENTS_RECEIVE LO6_MA=yes V6=$v6 raddb "$d"
+	start "$d" || { record $s "radiusd starts" ok no FAIL; return; }
+
+	# Message-Authenticator missing: every kind is one value, the text says which
+	rcase $s "$d" "no MA, require_message_authenticator" Message-Authenticator-Missing Access-Request ma-user \
+		'^Ignoring request to auth address 127\.0\.0\.1 port 1812 bound to server s_on from client 127\.0\.0\.5 port [0-9]+: no Message-Authenticator, which client ma5 requires$' \
+		127.0.0.5 $MA4 ma5-secret --src 127.0.0.5 --no-ma --user ma-user --password secret12 --tunnel-password --nas-id r_ma
+	rcase $s "$d" "no MA, NAS-Identifier entry" Message-Authenticator-Missing Access-Request x-user \
+		': no Message-Authenticator, which client sx requires$' \
+		127.0.66.1 $MA4 secret-x-66 --src 127.0.66.1 --no-ma --user x-user --password secret12 --nas-id x
+	rcase $s "$d" "Proxy-State, no MA, limit_proxy_state" Message-Authenticator-Missing Access-Request ps-user \
+		': Proxy-State without Message-Authenticator, which client lps9 refuses \(limit_proxy_state\)$' \
+		127.0.0.9 $MA4 lps9-secret --src 127.0.0.9 --no-ma --proxy-state --user ps-user --password secret12
+	rcase $s "$d" "Status-Server without MA" Message-Authenticator-Missing Status-Server '' \
+		': Status-Server without Message-Authenticator, client lo4$' \
+		127.0.0.1 $MA4 right --code status --no-ma
+	rcase $s "$d" "EAP-Message without MA" Message-Authenticator-Missing Access-Request eap-user \
+		': EAP-Message without Message-Authenticator, client lo4$' \
+		127.0.0.1 $MA4 right --no-ma --eap --user eap-user
+	rcase $s "$d" "EAP-Message and Proxy-State without MA, limit_proxy_state" Message-Authenticator-Missing \
+		Access-Request eap-user ': EAP-Message without Message-Authenticator, client lps9$' \
+		127.0.0.9 $MA4 lps9-secret --src 127.0.0.9 --no-ma --eap --proxy-state --user eap-user
+
+	# a packet code the port does not accept: decoded, not verified
+	rcase $s "$d" "Accounting-Request to the auth port" Wrong-Port Accounting-Request acct-user \
+		': packet code 4 \(Accounting-Request\) is not accepted here, client lo4$' \
+		127.0.0.1 $MA4 right --code acct --user acct-user --tunnel-password
+	rcase $s "$d" "Access-Request to the acct port" Wrong-Port Access-Request auth-user \
+		'^Ignoring request to acct address 127\.0\.0\.1 port 1813 bound to server s_on from client 127\.0\.0\.1 port [0-9]+: packet code 1 \(Access-Request\) is not accepted here, client lo4$' \
+		127.0.0.1 127.0.0.1 1813 right --user auth-user --password secret12 --tunnel-password --mppe
+	rcase $s "$d" "unknown code 99 to the auth port" Wrong-Port '*' '' \
+		': packet code 99 \(unknown\) is not accepted here, client lo4$' \
+		127.0.0.1 $MA4 right --raw "63010014$Z16"
+
+	# malformed, with a valid header: no attributes
+	rcase $s "$d" "attribute too short" Malformed-Request Access-Request '' \
+		': malformed packet \(attribute too short\), client lo4$' \
+		127.0.0.1 $MA4 right --raw "01020018${Z16}01010000"
+	rcase $s "$d" "acct: attribute 0" Malformed-Request Accounting-Request '' \
+		': malformed packet \(attribute 0\), client lo4$' \
+		127.0.0.1 127.0.0.1 1813 right --raw "04030018${Z16}00044141"
+	rcase $s "$d" "EAP-Message and User-Password, with MA" Malformed-Request Access-Request '' \
+		': malformed packet \(EAP-Message with another authentication attribute\), client lo4$' \
+		127.0.0.1 $MA4 right --eap --user both --password secret12
+
+	# stays as before: an invalid header is not a request; an unknown source is not logged
+	rcase $s "$d" "Length field < 20: no run" none '' '' ': malformed packet \(invalid header\), client lo4$' \
+		127.0.0.1 $MA4 right --raw "0106000b00000000000000"
+	rcase $s "$d" "unknown source, invalid header: no run, no line" none '' '' - \
+		127.0.0.77 $MA4 right --src 127.0.0.77 --raw "0107000b00000000000000"
+
+	# the same octets three times: three runs, no reply
+	sleep 1.1
+	n=$(grep -c '^r_retx|' "$d/refused.log")
+	out=$(nas $MA4 ma5-secret --src 127.0.0.5 --no-ma --user ma-user --nas-id r_retx --send 3 --gap 1.2)
+	sleep 0.3
+	expect $s "no MA, sent 3 times" "replies=0, 3 lines" "$out, $(($(grep -c '^r_retx|' "$d/refused.log") - n)) lines"
+
+	# controls: valid requests are handled, the refused server does not run
+	out=$(nas $MA4 right --user ok --password secret12 --nas-id r_ok)
+	expect $s "control: valid Access-Request" "replies=1 code=2, handled 1, 0 lines" \
+		"$out, handled $(normal "$d" r_ok), $(count "$d" r_ok) lines"
+	out=$(nas $MA4 ma5-secret --src 127.0.0.5 --user ok5 --password secret12 --nas-id r_ok5)
+	expect $s "control: ma5 with MA" "replies=1 code=2, handled 1, 0 lines" \
+		"$out, handled $(normal "$d" r_ok5), $(count "$d" r_ok5) lines"
+
+	# no option: as before, the daemon's line and nothing else
+	rcase $s "$d" "no option: no MA" none '' '' \
+		'^Ignoring request to auth address 127\.0\.0\.1 port 1822 bound to server s_off from client 127\.0\.0\.5 port [0-9]+: no Message-Authenticator, which client ma5 requires$' \
+		127.0.0.5 127.0.0.1 1822 ma5-secret --src 127.0.0.5 --no-ma --user ma-user --nas-id r_off
+	rcase $s "$d" "no option: Accounting-Request to the auth port" none '' '' \
+		': packet code 4 \(Accounting-Request\) is not accepted here, client lo4$' \
+		127.0.0.1 127.0.0.1 1822 right --code acct --user acct-user --nas-id r_off
+	rcase $s "$d" "no option: attribute too short" none '' '' ': malformed packet \(attribute too short\), client lo4$' \
+		127.0.0.1 127.0.0.1 1822 right --raw "01020018${Z16}01010000"
+
+	# IPv6: ::1 requires a Message-Authenticator here
+	if [ "$v6" = 1 ]; then
+		rcase $s "$d" "IPv6: no MA, require_message_authenticator" Message-Authenticator-Missing Access-Request v6-user \
+			'^Ignoring request to auth address ::1 port 1812 bound to server s_on from client ::1 port [0-9]+: no Message-Authenticator, which client lo6 requires$' \
+			::1 ::1 1812 right --no-ma --user v6-user --password secret12
+		rcase $s "$d" "IPv6: Accounting-Request to the auth port" Wrong-Port Accounting-Request v6-acct \
+			': packet code 4 \(Accounting-Request\) is not accepted here, client lo6$' \
+			::1 ::1 1812 right --code acct --user v6-acct
+		rcase $s "$d" "IPv6: Access-Request to the acct port" Wrong-Port Access-Request v6-auth \
+			': packet code 1 \(Access-Request\) is not accepted here, client lo6$' \
+			::1 ::1 1813 right --user v6-auth --password secret12
+		rcase $s "$d" "IPv6: attribute too short" Malformed-Request Access-Request '' \
+			': malformed packet \(attribute too short\), client lo6$' \
+			::1 ::1 1812 right --raw "01080018${Z16}01010000"
+		out=$(nas ::1 1812 right --user ok6 --password secret12 --nas-id r_ok6)
+		expect $s "IPv6 control: valid Access-Request" "replies=1 code=2, handled 1" "$out, handled $(normal "$d" r_ok6)"
+	fi
+
+	expect $s "radiusd still running" running "$(kill -0 "$PID" 2>/dev/null && echo running || echo exited)"
+	stop
+
+	# A burst of refused packets from one client; meanwhile another client's valid requests are
+	# timed.  The refused server runs in the worker threads, the socket reader is not held up.
+	# Its own radiusd: not in debug mode (the daemon's lines are then rate limited, and debug
+	# output does not slow the threads down), with max_requests and threads of a production
+	# server.  A burst larger than max_requests drops requests, valid ones too: as any burst.
+	d=$W/receive-burst
+	EXTRA_CLIENTS=$CLIENTS_RECEIVE MAXREQ=${BURST_MAXREQ:-1024} THREADS=${BURST_THREADS:-32} V6=0 raddb "$d"
+	start "$d" -f || { record $s "radiusd starts (burst)" ok no FAIL; return; }
+	# 25 packets every 2.5 ms (10000 a second): a flood the kernel's default socket buffer
+	# holds, so every refused packet reaches radiusd
+	m=$(grep -c 'from client 127\.0\.0\.5 port' "$d/radiusd.log")
+	t=$(date +%s)
+	out=$(python3 "$H/burst.py" 127.0.0.1 1812 127.0.0.5 ma5-secret right "$BURST" 25 2.5)
+	sleep 1
+	t=$(($(date +%s) - t + 1))
+	printf 'on, paced: %s\n' "$out" >>"$W/burst.txt"
+	say "burst, option, paced: $out"
+	eval "$(printf '%s\n' "$out" | tr ' ' '\n' | grep -E '^[a-z_]+=[0-9.a-z]+$' | sed 's/^/b_/')"
+	lines=$(grep -c '^burst|' "$d/refused.log")
+	expect $s "burst of $BURST: one run per packet radiusd read" "$((BURST - b_rcvbuf_errors))" "$lines"
+	expect $s "burst of $BURST: valid requests answered" "$b_valid_sent" "$b_valid_answered"
+	if [ "$b_burst_max_ms" != none ] && awk -v x="$b_burst_max_ms" -v b="$BURST_BOUND_MS" 'BEGIN { exit !(x < b) }'; then
+		record $s "burst of $BURST: valid round trip < ${BURST_BOUND_MS} ms" "< $BURST_BOUND_MS" "$out" PASS
+	else
+		record $s "burst of $BURST: valid round trip < ${BURST_BOUND_MS} ms" "< $BURST_BOUND_MS" "$out" FAIL
+	fi
+	n=$(($(grep -c 'from client 127\.0\.0\.5 port' "$d/radiusd.log") - m))
+	if [ "$n" -ge 1 ] && [ "$n" -le "$t" ]; then
+		record $s "burst of $BURST: daemon log lines" "1-$t (once a second)" "$n" PASS
+	else
+		record $s "burst of $BURST: daemon log lines" "1-$t (once a second)" "$n" FAIL
+	fi
+
+	# Unpaced, with and without the option: measured, not judged.  The kernel drops what the
+	# socket buffer does not hold, valid requests too, with or without the option.
+	sleep 1.1
+	out=$(python3 "$H/burst.py" 127.0.0.1 1812 127.0.0.5 ma5-secret right "$BURST")
+	sleep 1
+	printf 'on, unpaced: %s\n' "$out" >>"$W/burst.txt"
+	record $s "burst of $BURST unpaced, option (measured)" - "$out" PASS
+	sleep 1.1
+	out=$(python3 "$H/burst.py" 127.0.0.1 1822 127.0.0.5 ma5-secret right "$BURST")
+	sleep 1
+	printf 'off, unpaced: %s\n' "$out" >>"$W/burst.txt"
+	record $s "burst of $BURST unpaced, no option (measured)" - "$out" PASS
+	sleep 1.1
+	out=$(python3 "$H/burst.py" 127.0.0.1 1822 127.0.0.5 ma5-secret right "$BURST" 25 2.5)
+	sleep 1
+	printf 'off, paced: %s\n' "$out" >>"$W/burst.txt"
+	record $s "burst of $BURST paced, no option (measured)" - "$out" PASS
+
+	expect $s "radiusd still running (burst)" running "$(kill -0 "$PID" 2>/dev/null && echo running || echo exited)"
 	stop
 }
 
