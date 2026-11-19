@@ -38,6 +38,29 @@ python3 {
 	# This option prevales over "pass_all_vps"
 #	pass_all_vps_dict = no
 
+	#  Attribute values are passed to the callbacks as Python
+	#  strings, and string attributes arrive as the NAS sent them:
+	#  a User-Name in a legacy character set, or a User-Password
+	#  decrypted with the wrong shared secret, is not valid UTF-8.
+	#  By default such a value fails the call (the module returns
+	#  "fail" and the function is not called).
+	#
+	#  Set "unicode_errors" to the name of a Python codec error
+	#  handler to decode such a value with it instead:
+	#
+	#  - "strict" - fail the call (the default)
+	#  - "replace" - each invalid byte becomes U+FFFD
+	#  - "ignore" - invalid bytes are dropped
+	#  - "backslashreplace" - each invalid byte becomes \xNN
+	#    (note that this adds a backslash, which a script may read
+	#    as a DOMAIN\user separator)
+	#
+	#  Valid UTF-8 values are passed unchanged, and a value still
+	#  ends at its first NUL byte.  Each value that needed the
+	#  handler is noted in the debug output (by attribute name).
+	#
+#	unicode_errors = replace
+
 #	mod_instantiate = ${.module}
 #	func_instantiate = instantiate
 

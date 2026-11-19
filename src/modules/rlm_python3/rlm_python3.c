@@ -95,6 +95,7 @@ static CONF_PARSER module_config[] = {
         { "cext_compat", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, rlm_python_t, cext_compat), "yes" },
         { "pass_all_vps", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, rlm_python_t, pass_all_vps), "no" },
         { "pass_all_vps_dict", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, rlm_python_t, pass_all_vps_dict), "no" },
+	{ "unicode_errors", FR_CONF_OFFSET(PW_TYPE_STRING, rlm_python_t, unicode_errors), NULL },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -133,6 +134,22 @@ static struct {
 #undef A
 
 	{ NULL, 0 },
+};
+
+/*
+ *	Python codec error handlers which "unicode_errors" accepts.  Only the
+ *	built-in handlers which can decode and which give a str that encodes
+ *	back to UTF-8: xmlcharrefreplace and namereplace are encode-only (every
+ *	invalid value would fail the call), and surrogateescape / surrogatepass
+ *	give lone surrogates, which PyUnicode_AsUTF8() refuses when a script
+ *	hands the value back.
+ */
+static char const *unicode_errors_allowed[] = {
+	"strict",
+	"replace",
+	"ignore",
+	"backslashreplace",
+	NULL
 };
 
 typedef enum {
@@ -389,10 +406,11 @@ static void mod_vptuple(TALLOC_CTX *ctx, REQUEST *request, VALUE_PAIR **vps, PyO
  *	Pass the value-pair print strings in a tuple.
  *
  */
-static int mod_populate_vptuple(PyObject *pPair, VALUE_PAIR *vp)
+static int mod_populate_vptuple(REQUEST *request, PyObject *pPair, VALUE_PAIR *vp, char const *unicode_errors)
 {
 	PyObject *pStr = NULL;
 	char buf[1024];
+	Py_ssize_t len;
 
 	/* Look at the fr_pair_fprint_name? */
 
@@ -416,7 +434,22 @@ static int mod_populate_vptuple(PyObject *pPair, VALUE_PAIR *vp)
 
 	vp_prints_value(buf, sizeof(buf), vp, '\0');	/* Python doesn't need any escaping */
 
-	pStr = PyUnicode_FromString(buf);
+	/*
+	 *	The value ends at the first NUL, as it always has.
+	 *	String values are copied as they arrived, so they may
+	 *	not be valid UTF-8 (a User-Name in a legacy charset, a
+	 *	User-Password decrypted with the wrong secret).  By
+	 *	default that fails the call; with "unicode_errors" the
+	 *	value is decoded with that error handler instead.
+	 */
+	len = (Py_ssize_t) strlen(buf);
+	pStr = PyUnicode_DecodeUTF8(buf, len, NULL);
+	if (!pStr && unicode_errors && PyErr_ExceptionMatches(PyExc_UnicodeDecodeError)) {
+		PyErr_Clear();
+		RDEBUG2("%s is not valid UTF-8, decoding it with unicode_errors = %s",
+			vp->da->name, unicode_errors);
+		pStr = PyUnicode_DecodeUTF8(buf, len, unicode_errors);
+	}
 
 	if (pStr == NULL) {
 		ERROR("%s:%d, vp->da->name: %s", __func__, __LINE__, vp->da->name);
@@ -436,7 +469,8 @@ static int mod_populate_vptuple(PyObject *pPair, VALUE_PAIR *vp)
  * the indicated position in the tuple pArgs.
  * Returns false on error.
  */
-static bool mod_populate_vps(PyObject* pArgs, const int pos, VALUE_PAIR *vps)
+static bool mod_populate_vps(REQUEST *request, PyObject* pArgs, const int pos, VALUE_PAIR *vps,
+			     char const *unicode_errors)
 {
 	PyObject *vps_tuple = NULL;
 	int tuplelen = 0;
@@ -469,7 +503,7 @@ static bool mod_populate_vps(PyObject* pArgs, const int pos, VALUE_PAIR *vps)
 		/* The inside tuple has two only: */
 		if ((pPair = PyTuple_New(2)) == NULL) goto error;
 
-		if (mod_populate_vptuple(pPair, vp) == 0) {
+		if (mod_populate_vptuple(request, pPair, vp, unicode_errors) == 0) {
 			/* Put the tuple inside the container */
 			PyTuple_SET_ITEM(vps_tuple, i, pPair);
 		} else {
@@ -485,7 +519,8 @@ error:
 	return false;
 }
 
-static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char const *funcname, bool pass_all_vps, bool pass_all_vps_dict)
+static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char const *funcname, bool pass_all_vps,
+				    bool pass_all_vps_dict, char const *unicode_errors)
 {
 	PyObject	*pRet = NULL;
 	PyObject	*pArgs = NULL;
@@ -508,10 +543,10 @@ static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char cons
 
 	/* If there is a request, fill in the first 4 attribute lists */
 	if (request != NULL) {
-		if (!mod_populate_vps(pArgs, 0, request->packet->vps) ||
-		    !mod_populate_vps(pArgs, 1, request->reply->vps) ||
-		    !mod_populate_vps(pArgs, 2, request->config) ||
-		    !mod_populate_vps(pArgs, 3, request->state)) {
+		if (!mod_populate_vps(request, pArgs, 0, request->packet->vps, unicode_errors) ||
+		    !mod_populate_vps(request, pArgs, 1, request->reply->vps, unicode_errors) ||
+		    !mod_populate_vps(request, pArgs, 2, request->config, unicode_errors) ||
+		    !mod_populate_vps(request, pArgs, 3, request->state, unicode_errors)) {
 
 			ERROR("%s:%d, %s - mod_populate_vps failed", __func__, __LINE__, funcname);
 			ret = RLM_MODULE_FAIL;
@@ -521,7 +556,7 @@ static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char cons
 #ifdef WITH_PROXY
 		/* fill proxy vps */
 		if (request->proxy) {
-			if (!mod_populate_vps(pArgs, 4, request->proxy->vps)) {
+			if (!mod_populate_vps(request, pArgs, 4, request->proxy->vps, unicode_errors)) {
 				ERROR("%s:%d, %s - mod_populate_vps failed", __func__, __LINE__, funcname);
 				ret = RLM_MODULE_FAIL;
 				goto finish;
@@ -529,13 +564,13 @@ static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char cons
 		} else
 #endif
 		{
-			mod_populate_vps(pArgs, 4, NULL);
+			mod_populate_vps(request, pArgs, 4, NULL, NULL);
 		}
 
 #ifdef WITH_PROXY
 		/* fill proxy_reply vps */
 		if (request->proxy_reply) {
-			if (!mod_populate_vps(pArgs, 5, request->proxy_reply->vps)) {
+			if (!mod_populate_vps(request, pArgs, 5, request->proxy_reply->vps, unicode_errors)) {
 				ERROR("%s:%d, %s - mod_populate_vps failed", __func__, __LINE__, funcname);
 				ret = RLM_MODULE_FAIL;
 				goto finish;
@@ -543,12 +578,12 @@ static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char cons
 		} else
 #endif
 		{
-			mod_populate_vps(pArgs, 5, NULL);
+			mod_populate_vps(request, pArgs, 5, NULL, NULL);
 		}
 
 	}
 	/* If there is no request, set all the elements to None */
-	else for (i = 0; i < 6; i++) mod_populate_vps(pArgs, i, NULL);
+	else for (i = 0; i < 6; i++) mod_populate_vps(request, pArgs, i, NULL, NULL);
 
 	/*
 	 * Call Python function. If pass_all_vps_dict is true, a dictionary with the
@@ -829,7 +864,8 @@ static rlm_rcode_t do_python(rlm_python_t *inst, REQUEST *request, PyObject *pFu
 	RDEBUG3("Using thread state %p", this_thread->state);
 
 	PyEval_RestoreThread(this_thread->state);	/* Swap in our local thread state */
-	ret = do_python_single(request, pFunc, funcname, inst->pass_all_vps, inst->pass_all_vps_dict);
+	ret = do_python_single(request, pFunc, funcname, inst->pass_all_vps, inst->pass_all_vps_dict,
+			       inst->unicode_errors);
 	PyEval_SaveThread();
 
 	return ret;
@@ -1315,6 +1351,24 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		return -1;
 	}
 
+	if (inst->unicode_errors) {
+		int i;
+
+		for (i = 0; unicode_errors_allowed[i]; i++) {
+			if (strcmp(inst->unicode_errors, unicode_errors_allowed[i]) == 0) break;
+		}
+		if (!unicode_errors_allowed[i]) {
+			cf_log_err_cs(conf, "Invalid 'unicode_errors' value \"%s\", expected 'strict', "
+				      "'replace', 'ignore' or 'backslashreplace'", inst->unicode_errors);
+			return -1;
+		}
+
+		/*
+		 *	"strict" is the default, no need for a second decode.
+		 */
+		if (strcmp(inst->unicode_errors, "strict") == 0) inst->unicode_errors = NULL;
+	}
+
 	/*
 	 *	Load the python code required for this module instance
 	 */
@@ -1351,7 +1405,8 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	 */
 	if (!check_config && inst->instantiate.module_name && inst->instantiate.function_name) {
 
-		code = do_python_single(NULL, inst->instantiate.function, "instantiate", inst->pass_all_vps, inst->pass_all_vps_dict);
+		code = do_python_single(NULL, inst->instantiate.function, "instantiate", inst->pass_all_vps,
+					inst->pass_all_vps_dict, NULL);
 		if ((code < 0) || (code == RLM_MODULE_FAIL)) {
 		error:
 			python_error_log();	/* Needs valid thread with GIL */
@@ -1374,7 +1429,8 @@ static int mod_detach(void *instance)
 	 */
 	PyEval_RestoreThread(inst->sub_interpreter);
 
-	if (!check_config && inst->detach.function) ret = do_python_single(NULL, inst->detach.function, "detach", inst->pass_all_vps, inst->pass_all_vps_dict);
+	if (!check_config && inst->detach.function) ret = do_python_single(NULL, inst->detach.function, "detach",
+									   inst->pass_all_vps, inst->pass_all_vps_dict, NULL);
 
 #define PYTHON_FUNC_DESTROY(_x) python_function_destroy(&inst->_x)
 	PYTHON_FUNC_DESTROY(instantiate);
